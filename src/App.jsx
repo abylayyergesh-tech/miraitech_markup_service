@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import Plotly from 'plotly.js-dist-min'
 import './App.css'
 
@@ -55,6 +55,13 @@ export default function App() {
   // Session
   const [sessionId, setSessionId]       = useState('')
   const [sessionLabel, setSessionLabel] = useState('')
+
+  // Sessions list (for autocomplete)
+  const [sessionsList, setSessionsList]               = useState([])
+  const [sessionsListLoading, setSessionsListLoading] = useState(false)
+  const [showSessionDropdown, setShowSessionDropdown] = useState(false)
+  const sessionInputRef = useRef(null)
+  const dropdownRef     = useRef(null)
 
   // Files
   const [videoUrl, setVideoUrl]         = useState(null)
@@ -155,6 +162,41 @@ export default function App() {
   const handleLogout = useCallback(() => {
     setToken('')
     sessionStorage.removeItem('auth_token')
+  }, [])
+
+  // ── Sessions list fetch ───────────────────────────────────────────────────
+  useEffect(() => {
+    if (!token) { setSessionsList([]); return }
+    setSessionsListLoading(true)
+    fetch(`${API_BASE}/api/sessions?page_size=100`, {
+      headers: { 'accept': 'application/json', 'Authorization': `Bearer ${token}` },
+    })
+      .then(r => r.ok ? r.json() : Promise.reject())
+      .then(data => setSessionsList(data.items || []))
+      .catch(() => setSessionsList([]))
+      .finally(() => setSessionsListLoading(false))
+  }, [token])
+
+  const filteredSessions = useMemo(() => {
+    const q = sessionId.trim().toLowerCase()
+    if (!q) return sessionsList.slice(0, 25)
+    return sessionsList.filter(s =>
+      String(s.id).includes(q) ||
+      (s.member_name && s.member_name.toLowerCase().includes(q)) ||
+      (s.session_title && s.session_title.toLowerCase().includes(q))
+    ).slice(0, 25)
+  }, [sessionsList, sessionId])
+
+  // close dropdown on outside click
+  useEffect(() => {
+    const onDown = (e) => {
+      if (
+        sessionInputRef.current && !sessionInputRef.current.contains(e.target) &&
+        dropdownRef.current && !dropdownRef.current.contains(e.target)
+      ) setShowSessionDropdown(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
   }, [])
 
   // ── Session loader ────────────────────────────────────────────────────────
@@ -730,18 +772,45 @@ export default function App() {
 
         <div className="session-group">
           <span className="session-lbl">Сессия №</span>
-          <input
-            type="number"
-            className="input-sm session-input"
-            value={sessionId}
-            onChange={e => setSessionId(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && loadSession()}
-            placeholder="3421"
-            min="1"
-          />
+          <div className="session-combo">
+            <input
+              ref={sessionInputRef}
+              type="text"
+              inputMode="numeric"
+              className="input-sm session-input"
+              value={sessionId}
+              onChange={e => { setSessionId(e.target.value); setShowSessionDropdown(true) }}
+              onFocus={() => setShowSessionDropdown(true)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') { setShowSessionDropdown(false); loadSession() }
+                if (e.key === 'Escape') setShowSessionDropdown(false)
+              }}
+              placeholder={sessionsListLoading ? 'Загрузка…' : '3421'}
+              autoComplete="off"
+            />
+            {showSessionDropdown && filteredSessions.length > 0 && (
+              <ul ref={dropdownRef} className="session-dropdown">
+                {filteredSessions.map(s => (
+                  <li
+                    key={s.id}
+                    className={`session-dropdown-item${String(s.id) === sessionId ? ' selected' : ''}`}
+                    onMouseDown={e => {
+                      e.preventDefault()
+                      setSessionId(String(s.id))
+                      setShowSessionDropdown(false)
+                    }}
+                  >
+                    <span className="sdi-id">#{s.id}</span>
+                    <span className="sdi-name">{s.member_name || '—'}</span>
+                    {s.date && <span className="sdi-date">{s.date.slice(0, 10)}</span>}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
           <button
             className="btn-build"
-            onClick={loadSession}
+            onClick={() => { setShowSessionDropdown(false); loadSession() }}
             disabled={!sessionId.trim() || status.type === 'loading'}
           >
             ⬇ Загрузить
