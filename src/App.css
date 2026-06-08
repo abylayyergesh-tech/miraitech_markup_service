@@ -758,7 +758,62 @@ body { background: var(--bg); overflow: hidden }
 }
 
 .session-input {
-  width: 90px;
+  width: 110px;
+}
+
+/* ── Session combobox ────────────────────────────────────────────────── */
+.session-combo {
+  position: relative;
+}
+
+.session-dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 200;
+  min-width: 260px;
+  max-height: 260px;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 6px 20px rgba(0,0,0,.12);
+  padding: 4px 0;
+  list-style: none;
+}
+
+.session-dropdown-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+  transition: background .1s;
+  white-space: nowrap;
+}
+.session-dropdown-item:hover,
+.session-dropdown-item.selected {
+  background: #eff6ff;
+}
+
+.sdi-id {
+  font-weight: 700;
+  color: var(--primary);
+  font-size: 12px;
+  min-width: 40px;
+}
+.sdi-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  color: var(--text);
+}
+.sdi-date {
+  font-size: 11px;
+  color: var(--text2);
+  margin-left: auto;
+  padding-left: 8px;
 }
 
 /* ── Logout button ───────────────────────────────────────────────────── */
