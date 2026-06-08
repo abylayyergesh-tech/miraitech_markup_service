@@ -830,6 +830,47 @@ body { background: var(--bg); overflow: hidden }
 }
 .logout-btn:hover { background: rgba(255,255,255,.18); color: #e2e8f0 }
 
+/* ── Sensor Hz stats ─────────────────────────────────────────────────── */
+.sensor-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.hz-stats {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  border: 1px solid color-mix(in srgb, var(--hzc, #888) 40%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--hzc, #888) 6%, transparent);
+  overflow: hidden;
+  font-size: 11px;
+}
+.hz-stat-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 7px;
+}
+.hz-stat-key {
+  font-weight: 700;
+  color: var(--text2);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: .04em;
+}
+.hz-stat-val {
+  font-weight: 600;
+  color: var(--hzc, var(--text));
+  font-variant-numeric: tabular-nums;
+}
+.hz-stat-sep {
+  width: 1px;
+  height: 14px;
+  background: color-mix(in srgb, var(--hzc, #888) 30%, transparent);
+  flex-shrink: 0;
+}
+
 /* ── Responsive ─────────────────────────────────────────────────────── */
 @media (max-width: 768px) {
   .content        { flex-direction: column }

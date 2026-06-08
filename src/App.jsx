@@ -82,6 +82,7 @@ export default function App() {
   const [sensorNames, setSensorNames]   = useState([])
   const [showSensor1, setShowSensor1]   = useState(true)
   const [showSensor2, setShowSensor2]   = useState(true)
+  const [checkHzData, setCheckHzData]   = useState(null)
   const [selectedCols, setSelectedCols] = useState([])
   const [timeCol, setTimeCol]           = useState('Time')
   const [offsetS1, setOffsetS1]         = useState(0)
@@ -226,6 +227,7 @@ export default function App() {
     setShowRightPatterns(true)
     setShowSensor1(true)
     setShowSensor2(true)
+    setCheckHzData(null)
 
     try {
       const resp = await fetch(`${API_BASE}/api/sessions/${sid}`, {
@@ -282,6 +284,13 @@ export default function App() {
       timeUnitRef.current = autoUnit
 
       setStatus({ text: `✓ ${rows.length} строк · ${numCols.length} колонок · ${autoUnit}`, type: 'ok' })
+
+      fetch(`${API_BASE}/api/check_hz/${sid}`, {
+        headers: { 'accept': 'application/json', 'Authorization': `Bearer ${token}` },
+      })
+        .then(r => r.ok ? r.json() : Promise.reject())
+        .then(data => setCheckHzData(data))
+        .catch(() => setCheckHzData(null))
     } catch (err) {
       setStatus({ text: `Ошибка: ${err.message}`, type: 'error' })
     }
@@ -911,16 +920,31 @@ export default function App() {
                 const toggle    = () => isS1 ? setShowSensor1(v => !v) : setShowSensor2(v => !v)
                 const color     = isS1 ? PALETTE[0] : '#ff7f0e'
                 const bg        = isS1 ? 'rgba(31,119,180,0.08)' : 'rgba(255,127,14,0.08)'
+                const stats     = checkHzData?.[name]
                 return (
-                  <button
-                    key={name}
-                    className={`sensor-badge${isVisible ? '' : ' sensor-badge-off'}`}
-                    style={isVisible ? { borderColor: color, color, background: bg } : {}}
-                    onClick={toggle}
-                    title={isVisible ? `Скрыть ${name}` : `Показать ${name}`}
-                  >
-                    {isVisible ? '●' : '○'}&nbsp;{name.replace('ESP32_', '')}&nbsp;{i === 0 ? '(left)' : '(right)'}
-                  </button>
+                  <span key={name} className="sensor-group">
+                    <button
+                      className={`sensor-badge${isVisible ? '' : ' sensor-badge-off'}`}
+                      style={isVisible ? { borderColor: color, color, background: bg } : {}}
+                      onClick={toggle}
+                      title={isVisible ? `Скрыть ${name}` : `Показать ${name}`}
+                    >
+                      {isVisible ? '●' : '○'}&nbsp;{name.replace('ESP32_', '')}&nbsp;{i === 0 ? '(left)' : '(right)'}
+                    </button>
+                    {stats && (
+                      <span className="hz-stats" style={{ '--hzc': color }}>
+                        <span className="hz-stat-item" title="Среднее время между сэмплами">
+                          <span className="hz-stat-key">mean</span>
+                          <span className="hz-stat-val">{stats.time_diff_mean ?? '—'}</span>
+                        </span>
+                        <span className="hz-stat-sep" />
+                        <span className="hz-stat-item" title="Максимальное время между сэмплами">
+                          <span className="hz-stat-key">max</span>
+                          <span className="hz-stat-val">{stats.time_diff_max ?? '—'}</span>
+                        </span>
+                      </span>
+                    )}
+                  </span>
                 )
               })}
             </div>
