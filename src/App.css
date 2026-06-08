@@ -99,6 +99,74 @@ body { background: var(--bg); overflow: hidden }
 }
 .ctrl-sep { width: 1px; height: 16px; background: var(--border); margin: 0 6px }
 
+/* Per-sensor offset inputs */
+.offset-pair {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.offset-lbl {
+  font-size: 11px; font-weight: 700;
+  padding: 2px 5px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+.offset-lbl-s1 { background: rgba(31,119,180,0.15); color: #1d4ed8 }
+.offset-lbl-s2 { background: rgba(255,127,14,0.15);  color: #c2410c }
+
+/* Offset input with custom spinners */
+.offset-input-wrap {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1.5px solid var(--border);
+  border-radius: 5px;
+  overflow: hidden;
+  width: 96px;
+}
+.offset-input-wrap:focus-within {
+  border-color: var(--primary);
+}
+.offset-input-field {
+  flex: 1;
+  min-width: 0;
+  border: none !important;
+  border-radius: 0 !important;
+  padding: 4px 6px;
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  outline: none;
+  background: var(--surface);
+  color: var(--text);
+}
+.offset-spinners {
+  display: flex;
+  flex-direction: column;
+  border-left: 1.5px solid var(--border);
+  flex-shrink: 0;
+}
+.offset-spin-btn {
+  flex: 1;
+  width: 18px;
+  padding: 0;
+  border: none;
+  background: #f8f9fa;
+  color: var(--text2);
+  font-size: 7px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background .1s, color .1s;
+  user-select: none;
+}
+.offset-spin-btn:hover  { background: #e9ecef; color: var(--text) }
+.offset-spin-btn:active { background: #dee2e6 }
+.offset-spin-btn + .offset-spin-btn {
+  border-top: 1px solid var(--border);
+}
+
 /* Sensor buttons */
 .sensor-btn {
   padding: 4px 13px;
@@ -494,6 +562,69 @@ body { background: var(--bg); overflow: hidden }
 }
 .lab-stat-l { color: #1d4ed8; font-weight: 600 }
 .lab-stat-r { color: #c2410c; font-weight: 600 }
+
+/* ── Zone durations ─────────────────────────────────────────────────── */
+.zone-dur-block {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 4px 8px;
+  background: #f8f9fa;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.zone-dur-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
+.zone-dur-label {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.zone-dur-s1 { background: rgba(31,119,180,0.15); color: #1d4ed8 }
+.zone-dur-s2 { background: rgba(255,127,14,0.15);  color: #c2410c }
+
+.zone-dur-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: default;
+  flex-shrink: 0;
+}
+.zone-dur-chip.zone-dur-s1 {
+  background: rgba(31,119,180,0.1);
+  border: 1px solid rgba(31,119,180,0.35);
+  color: #1e40af;
+}
+.zone-dur-chip.zone-dur-s2 {
+  background: rgba(255,127,14,0.1);
+  border: 1px solid rgba(255,127,14,0.4);
+  color: #9a3412;
+}
+.zone-dur-chip.zone-dur-pending {
+  background: #fefce8;
+  border: 1px dashed #f59e0b;
+  color: #92400e;
+  font-weight: 500;
+  font-style: italic;
+  font-size: 10.5px;
+}
 
 /* ── Chart area ─────────────────────────────────────────────────────── */
 .chart-area {

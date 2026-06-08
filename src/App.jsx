@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import Plotly from 'plotly.js-dist-min'
+import { parquetReadObjects } from 'hyparquet'
 import './App.css'
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -30,6 +31,14 @@ function formatTime(s) {
   const m = Math.floor(s / 60)
   const sec = (s % 60).toFixed(1).padStart(4, '0')
   return `${m}:${sec}`
+}
+function formatDuration(d, unit) {
+  if (!isFinite(d) || d < 0) return '—'
+  if (unit === 'ms') {
+    if (d >= 1000) return (d / 1000).toFixed(2) + 'с'
+    return d.toFixed(0) + 'мс'
+  }
+  return d.toFixed(3) + 'с'
 }
 
 function buildCursorShapes(x, n) {
@@ -68,7 +77,8 @@ export default function App() {
   const [showSensor2, setShowSensor2]   = useState(true)
   const [selectedCols, setSelectedCols] = useState([])
   const [timeCol, setTimeCol]           = useState('Time')
-  const [offset, setOffset]             = useState(0)
+  const [offsetS1, setOffsetS1]         = useState(0)
+  const [offsetS2, setOffsetS2]         = useState(0)
   const [timeUnit, setTimeUnit]         = useState('ms')
 
   // Video state
@@ -99,7 +109,8 @@ export default function App() {
   const chartDivRef     = useRef(null)
   const timelineRef     = useRef(null)
   const videoUrlRef     = useRef(null)
-  const offsetRef       = useRef(0)
+  const offsetS1Ref     = useRef(0)
+  const offsetS2Ref     = useRef(0)
   const timeUnitRef     = useRef('ms')
   const lastTRef        = useRef(null)
   const plotInitRef      = useRef(false)
@@ -119,7 +130,8 @@ export default function App() {
   const s1TraceIdxRef    = useRef([])
   const s2TraceIdxRef    = useRef([])
 
-  useEffect(() => { offsetRef.current      = offset       }, [offset])
+  useEffect(() => { offsetS1Ref.current    = offsetS1     }, [offsetS1])
+  useEffect(() => { offsetS2Ref.current    = offsetS2     }, [offsetS2])
   useEffect(() => { timeUnitRef.current    = timeUnit     }, [timeUnit])
   useEffect(() => { labelingRef.current    = labelingMode }, [labelingMode])
   useEffect(() => { currentFootRef.current = currentFoot  }, [currentFoot])
@@ -446,11 +458,74 @@ export default function App() {
     setCurrentTime(0)
   }, [])
 
+  // ── Parquet loader ────────────────────────────────────────────────────────
+  const loadParquetFile = useCallback(async (file) => {
+    setStatus({ text: `Читаю ${file.name}…`, type: 'loading' })
+    setSessionLabel(file.name)
+    setChartReady(false)
+    plotInitRef.current = false
+    setLeftContacts([])
+    setRightContacts([])
+    setShowLeftPatterns(true)
+    setShowRightPatterns(true)
+    setShowSensor1(true)
+    setShowSensor2(true)
+
+    try {
+      const arrayBuffer = await file.arrayBuffer()
+      const rows = await parquetReadObjects({ file: arrayBuffer })
+
+      if (!rows?.length) { setStatus({ text: 'Файл пустой', type: 'error' }); return }
+
+      const colMap = {}
+      Object.keys(rows[0]).forEach(k => { colMap[k] = [] })
+      rows.forEach(row => Object.entries(row).forEach(([k, v]) => {
+        colMap[k].push(typeof v === 'bigint' ? Number(v) : v)
+      }))
+      setParquetData(colMap)
+
+      const allCols = Object.keys(colMap)
+      const tCol = allCols.find(c => c === 'Time')
+             || allCols.find(c => ['time', 'timestamp', 'Timestamp', 't'].includes(c))
+             || allCols[0]
+      setTimeCol(tCol)
+
+      if (colMap['Name']) {
+        const names = [...new Set(colMap['Name'].filter(v => v != null && v !== ''))]
+          .sort((a, b) => a.localeCompare(b))
+        setSensorNames(names)
+      } else {
+        setSensorNames([])
+      }
+
+      const numCols = allCols.filter(c => {
+        if (NON_DATA_COLS.has(c) || c === tCol) return false
+        const s = colMap[c].find(v => v != null)
+        return s !== undefined && typeof s !== 'string'
+      })
+      setColumns(numCols)
+
+      const defaults = PREFERRED_COLS.filter(c => numCols.includes(c)).slice(0, 3)
+      setSelectedCols(defaults.length ? defaults : numCols.slice(0, 3))
+
+      const tVals   = (colMap[tCol] || []).map(safeNum).filter(v => v !== null)
+      const tMax    = tVals.length ? Math.max(...tVals) : 0
+      const autoUnit = tMax > 3600 ? 'ms' : 's'
+      setTimeUnit(autoUnit)
+      timeUnitRef.current = autoUnit
+
+      setStatus({ text: `✓ ${rows.length} строк · ${numCols.length} колонок · ${autoUnit}`, type: 'ok' })
+    } catch (err) {
+      setStatus({ text: `Ошибка чтения parquet: ${err.message}`, type: 'error' })
+    }
+  }, [])
+
   const handleFiles = useCallback((files) => {
     ;[...files].forEach(f => {
       if (f.type.startsWith('video/') || /\.(mp4|webm|mov|avi|mkv)$/i.test(f.name)) loadVideo(f)
+      else if (/\.parquet$/i.test(f.name)) loadParquetFile(f)
     })
-  }, [loadVideo])
+  }, [loadVideo, loadParquetFile])
 
   // ── Build Plotly chart ────────────────────────────────────────────────────
   const renderChart = useCallback(() => {
@@ -473,8 +548,10 @@ export default function App() {
     const data1 = filterBySensor(sensor1Name)
     const data2 = sensor2Name ? filterBySensor(sensor2Name) : null
 
-    const tArr1 = (data1[timeCol] || []).map(safeNum)
-    const tArr2 = data2 ? (data2[timeCol] || []).map(safeNum) : []
+    const shift1 = offsetS1Ref.current
+    const shift2 = offsetS2Ref.current
+    const tArr1 = (data1[timeCol] || []).map(v => { const n = safeNum(v); return n !== null ? n + shift1 : null })
+    const tArr2 = data2 ? (data2[timeCol] || []).map(v => { const n = safeNum(v); return n !== null ? n + shift2 : null }) : []
 
     const allTVals = [...tArr1, ...tArr2].filter(v => v !== null)
     if (!allTVals.length) {
@@ -590,11 +667,12 @@ export default function App() {
           if (currentFootRef.current === 'left') setLeftContacts(p => [...p, t])
           else setRightContacts(p => [...p, t])
         } else if (videoRef.current) {
-          videoRef.current.currentTime = Math.max(0, t - offsetRef.current)
+          const scale = timeUnitRef.current === 'ms' ? 1000 : 1
+          videoRef.current.currentTime = Math.max(0, t / scale)
         }
       })
     })
-  }, [parquetData, selectedCols, timeCol, sensorNames, updateContactShapes])
+  }, [parquetData, selectedCols, timeCol, sensorNames, offsetS1, offsetS2, updateContactShapes])
 
   // ── Video timeupdate → move chart cursor ──────────────────────────────────
   const handleTimeUpdate = useCallback(() => {
@@ -604,7 +682,7 @@ export default function App() {
 
     if (vidLblRef.current) vidLblRef.current.textContent = formatTime(t)
     const scale = timeUnitRef.current === 'ms' ? 1000 : 1
-    const imuT  = t * scale + offsetRef.current
+    const imuT  = t * scale
     if (imuLblRef.current) imuLblRef.current.textContent =
       `IMU ${timeUnitRef.current === 'ms' ? imuT.toFixed(0) + 'ms' : imuT.toFixed(2) + 's'}`
 
@@ -727,6 +805,7 @@ export default function App() {
       {/* ── Toolbar ── */}
       <div className="toolbar">
         <UploadBtn accept="video/*,.mp4,.webm,.mov,.avi" onFile={loadVideo}>📹 Видео</UploadBtn>
+        <UploadBtn accept=".parquet" onFile={loadParquetFile}>📊 Parquet</UploadBtn>
 
         <div className="session-group">
           <span className="session-lbl">Сессия №</span>
@@ -792,13 +871,25 @@ export default function App() {
             <button className="col-chip ghost" onClick={() => setSelectedCols([...columns])}>все</button>
             <button className="col-chip ghost" onClick={() => setSelectedCols([])}>сброс</button>
             <span className="ctrl-sep" />
-            <input
-              type="number" className="input-sm" value={offset}
-              step={timeUnit === 'ms' ? 100 : 0.05}
-              style={{ width: 72 }}
-              title="Сдвиг IMU"
-              onChange={e => setOffset(Number(e.target.value))}
-            />
+            <span className="ctrl-lbl" style={{ minWidth: 'unset' }}>↔</span>
+            <span className="offset-pair">
+              <span className="offset-lbl offset-lbl-s1">S1</span>
+              <OffsetInput
+                value={offsetS1}
+                step={timeUnit === 'ms' ? 100 : 0.05}
+                title="Сдвиг Sensor 1 (левая нога)"
+                onChange={setOffsetS1}
+              />
+            </span>
+            <span className="offset-pair">
+              <span className="offset-lbl offset-lbl-s2">S2</span>
+              <OffsetInput
+                value={offsetS2}
+                step={timeUnit === 'ms' ? 100 : 0.05}
+                title="Сдвиг Sensor 2 (правая нога)"
+                onChange={setOffsetS2}
+              />
+            </span>
             <div className="unit-toggle">
               <button className={`unit-btn${timeUnit === 's'  ? ' active' : ''}`} onClick={() => setTimeUnit('s')}>с</button>
               <button className={`unit-btn${timeUnit === 'ms' ? ' active' : ''}`} onClick={() => setTimeUnit('ms')}>мс</button>
@@ -860,7 +951,7 @@ export default function App() {
           <div className="time-bar">
             <span ref={vidLblRef} className="time-lbl">0:00.0</span>
             <span ref={imuLblRef} className="time-lbl imu-lbl">IMU 0.00s</span>
-            <span className="time-lbl muted">↔ {offset}{timeUnit === 'ms' ? 'мс' : 'с'}</span>
+            <span className="time-lbl muted">S1:{offsetS1} S2:{offsetS2}{timeUnit === 'ms' ? 'мс' : 'с'}</span>
             <span className="time-lbl muted dur">{formatTime(videoDuration)}</span>
           </div>
 
@@ -950,6 +1041,36 @@ export default function App() {
                   <span className="lab-stat-r">S2: {Math.floor(rightContacts.length / 2)}</span>
                   {' интерв.'}
                 </span>
+
+                {(leftContacts.length > 0 || rightContacts.length > 0) && (
+                  <div className="zone-dur-block">
+                    {[
+                      { contacts: leftContacts, cls: 'zone-dur-s1', label: 'S1' },
+                      { contacts: rightContacts, cls: 'zone-dur-s2', label: 'S2' },
+                    ].map(({ contacts, cls, label }) => contacts.length > 0 && (
+                      <div key={label} className="zone-dur-row">
+                        <span className={`zone-dur-label ${cls}`}>{label}</span>
+                        {Array.from({ length: Math.floor(contacts.length / 2) }, (_, i) => {
+                          const t0 = contacts[i * 2]
+                          const t1 = contacts[i * 2 + 1]
+                          const dur = Math.abs(t1 - t0)
+                          return (
+                            <span
+                              key={i}
+                              className={`zone-dur-chip ${cls}`}
+                              title={`${t0.toFixed(2)} → ${t1.toFixed(2)}`}
+                            >
+                              #{i + 1}&thinsp;{formatDuration(dur, timeUnit)}
+                            </span>
+                          )
+                        })}
+                        {contacts.length % 2 === 1 && (
+                          <span className="zone-dur-chip zone-dur-pending">…2-я точка</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </>
             )}
           </div>
@@ -960,7 +1081,7 @@ export default function App() {
               <div className="chart-empty">
                 {parquetData
                   ? <><span>📊</span><p>Выберите колонки и нажмите <b>▶ Построить</b></p></>
-                  : <><span>📊</span><p>Введите номер сессии и нажмите <b>⬇ Загрузить</b></p></>
+                  : <><span>📊</span><p>Загрузите <b>.parquet</b>-файл или введите номер сессии</p></>
                 }
               </div>
             )}
@@ -970,7 +1091,7 @@ export default function App() {
 
       {dragOver && (
         <div className="drag-overlay">
-          <div className="drag-box">⬇<p>Отпустите файл</p></div>
+          <div className="drag-box">⬇<p>Видео или .parquet</p></div>
         </div>
       )}
     </div>
@@ -989,4 +1110,59 @@ function UploadBtn({ accept, onFile, children }) {
 
 function FileBadge({ type, children }) {
   return <span className={`file-badge badge-${type}`}>{children}</span>
+}
+
+function OffsetInput({ value, step, title, onChange }) {
+  const [draft, setDraft] = useState(String(value))
+  const committed = useRef(value)
+
+  useEffect(() => {
+    if (committed.current !== value) {
+      committed.current = value
+      setDraft(String(value))
+    }
+  }, [value])
+
+  const commit = (raw) => {
+    const trimmed = raw.trim()
+    const n = Number(trimmed)
+    if (trimmed !== '' && isFinite(n)) {
+      committed.current = n
+      onChange(n)
+      setDraft(String(n))
+    } else {
+      setDraft(String(committed.current))
+    }
+  }
+
+  const nudge = (dir) => {
+    const base = isFinite(Number(draft)) ? Number(draft) : committed.current
+    const next = Math.round((base + dir * step) * 1e9) / 1e9
+    committed.current = next
+    onChange(next)
+    setDraft(String(next))
+  }
+
+  return (
+    <div className="offset-input-wrap">
+      <input
+        type="text"
+        inputMode="numeric"
+        className="input-sm offset-input-field"
+        value={draft}
+        title={title}
+        onChange={e => setDraft(e.target.value)}
+        onBlur={e => commit(e.target.value)}
+        onKeyDown={e => {
+          if (e.key === 'Enter')     { e.preventDefault(); commit(draft) }
+          if (e.key === 'ArrowUp')   { e.preventDefault(); nudge(+1) }
+          if (e.key === 'ArrowDown') { e.preventDefault(); nudge(-1) }
+        }}
+      />
+      <div className="offset-spinners">
+        <button className="offset-spin-btn" tabIndex={-1} onMouseDown={e => { e.preventDefault(); nudge(+1) }}>▲</button>
+        <button className="offset-spin-btn" tabIndex={-1} onMouseDown={e => { e.preventDefault(); nudge(-1) }}>▼</button>
+      </div>
+    </div>
+  )
 }
