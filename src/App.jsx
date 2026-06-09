@@ -58,6 +58,23 @@ function safeNum(v) {
   const n = typeof v === 'bigint' ? Number(v) : Number(v)
   return isFinite(n) ? n : null
 }
+
+function unwrapAngleDegrees(arr, threshold = 180.0) {
+  if (!arr || arr.length === 0) return arr
+  const result = new Array(arr.length)
+  result[0] = arr[0]
+  let offset = 0
+  for (let i = 1; i < arr.length; i++) {
+    const curr = safeNum(arr[i])
+    const prev = safeNum(arr[i - 1])
+    if (curr === null || prev === null) { result[i] = arr[i]; continue }
+    const diff = curr - prev
+    if (diff > threshold) offset -= 360
+    else if (diff < -threshold) offset += 360
+    result[i] = arr[i] + offset
+  }
+  return result
+}
 function formatTime(s) {
   if (!isFinite(s) || s < 0) return '0:00.0'
   const m = Math.floor(s / 60)
@@ -160,6 +177,7 @@ export default function App() {
   const [showRightPatterns, setShowRightPatterns] = useState(true)
   const [showGaps, setShowGaps]                   = useState(false)
   const [selectedMarkup, setSelectedMarkup]       = useState(null)
+  const [anglesUnwrapped, setAnglesUnwrapped]     = useState(false)
 
   // Refs
   const videoRef        = useRef(null)
@@ -176,6 +194,7 @@ export default function App() {
   const gapShapesRef     = useRef([])
   const cursorShapesRef  = useRef([])
   const selectedColsRef  = useRef([])
+  const anglesUnwrappedRef = useRef(false)
   const isDragging       = useRef(false)
   const isVideoPan      = useRef(false)
   const vidLblRef       = useRef(null)
@@ -198,6 +217,7 @@ export default function App() {
   useEffect(() => { currentFootRef.current = currentFoot  }, [currentFoot])
   useEffect(() => { selectedColsRef.current = selectedCols }, [selectedCols])
   useEffect(() => { showGapsRef.current = showGaps }, [showGaps])
+  useEffect(() => { anglesUnwrappedRef.current = anglesUnwrapped }, [anglesUnwrapped])
   useEffect(() => { selectedMarkupRef.current = selectedMarkup }, [selectedMarkup])
 
   useEffect(() => {
@@ -295,6 +315,8 @@ export default function App() {
     setShowGaps(false)
     setCheckHzData(null)
     setSelectedMarkup(null)
+    anglesUnwrappedRef.current = false
+    setAnglesUnwrapped(false)
 
     try {
       const resp = await fetch(`${API_BASE}/api/sessions/${sid}`, {
@@ -663,6 +685,8 @@ export default function App() {
     setShowGaps(false)
     setCheckHzData(null)
     setSelectedMarkup(null)
+    anglesUnwrappedRef.current = false
+    setAnglesUnwrapped(false)
 
     try {
       const arrayBuffer = await file.arrayBuffer()
@@ -738,8 +762,14 @@ export default function App() {
       return out
     }
 
-    const data1 = filterBySensor(sensor1Name)
-    const data2 = sensor2Name ? filterBySensor(sensor2Name) : null
+    const applyUnwrap = (d) => {
+      if (!anglesUnwrappedRef.current || !d) return d
+      const out = { ...d }
+      selectedCols.forEach(col => { if (out[col]) out[col] = unwrapAngleDegrees(out[col]) })
+      return out
+    }
+    const data1 = applyUnwrap(filterBySensor(sensor1Name))
+    const data2 = sensor2Name ? applyUnwrap(filterBySensor(sensor2Name)) : null
 
     const shift1 = offsetS1Ref.current
     const shift2 = offsetS2Ref.current
@@ -867,6 +897,13 @@ export default function App() {
       })
     })
   }, [parquetData, selectedCols, timeCol, sensorNames, offsetS1, offsetS2, updateOverlayShapes])
+
+  const handleUnwrapAngles = useCallback(() => {
+    if (!parquetData || !selectedCols.length) return
+    anglesUnwrappedRef.current = !anglesUnwrappedRef.current
+    setAnglesUnwrapped(anglesUnwrappedRef.current)
+    renderChart()
+  }, [parquetData, selectedCols, renderChart])
 
   // ── Video timeupdate → move chart cursor ──────────────────────────────────
   const handleTimeUpdate = useCallback(() => {
@@ -1132,6 +1169,14 @@ export default function App() {
               <button className={`unit-btn${timeUnit === 's'  ? ' active' : ''}`} onClick={() => setTimeUnit('s')}>с</button>
               <button className={`unit-btn${timeUnit === 'ms' ? ' active' : ''}`} onClick={() => setTimeUnit('ms')}>мс</button>
             </div>
+            <button
+              className={`btn-unwrap${anglesUnwrapped ? ' active' : ''}`}
+              disabled={!selectedCols.length}
+              onClick={handleUnwrapAngles}
+              title={anglesUnwrapped ? 'Вернуть исходные углы' : 'Развернуть углы (убрать скачки ±360°)'}
+            >
+              ↺ {anglesUnwrapped ? 'Углы развёрнуты' : 'Развернуть углы'}
+            </button>
             <button className="btn-build" disabled={!selectedCols.length} onClick={renderChart}>
               ▶ Построить
             </button>
