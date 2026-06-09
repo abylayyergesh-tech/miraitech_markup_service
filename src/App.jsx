@@ -4,7 +4,15 @@ import { parquetReadObjects } from 'hyparquet'
 import './App.css'
 
 // ── Constants ──────────────────────────────────────────────────────────────
-const API_BASE = 'http://localhost:8000'
+const API_BASE = import.meta.env.VITE_API_BASE ?? ''
+
+function parseApiError(errData, status) {
+  const detail = errData?.detail
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) return detail.map(d => d.msg || String(d)).join('; ')
+  if (detail && typeof detail === 'object') return detail.message || JSON.stringify(detail)
+  return `Ошибка ${status}`
+}
 
 const PALETTE = [
   '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
@@ -22,6 +30,8 @@ const L_LINE = 'rgba(31,119,180,0.9)'
 const R_LINE = 'rgba(255,127,14,0.9)'
 const GAP_FILL = 'rgba(220,53,69,0.35)'
 const GAP_LINE = 'rgba(220,53,69,0.92)'
+const SEL_FILL = 'rgba(234,179,8,0.5)'
+const SEL_LINE = '#ca8a04'
 
 function buildGapBandShapes(intervals, nSubplots) {
   if (!intervals.length || nSubplots < 1) return []
@@ -72,6 +82,22 @@ function buildCursorShapes(x, n) {
     yref: i === 0 ? 'y domain' : `y${i + 1} domain`,
     line: { color: 'rgba(220,40,40,0.85)', width: 2, dash: 'dot' },
   }))
+}
+
+function buildSelectedPointShapes(x, n) {
+  return Array.from({ length: n }, (_, i) => ({
+    type: 'line',
+    x0: x, x1: x,
+    y0: 0, y1: 1,
+    xref: 'x',
+    yref: i === 0 ? 'y domain' : `y${i + 1} domain`,
+    line: { color: SEL_LINE, width: 3.5 },
+    layer: 'above',
+  }))
+}
+
+function getPairStartIndex(index) {
+  return index - (index % 2)
 }
 
 // ── Main App ───────────────────────────────────────────────────────────────
@@ -133,6 +159,7 @@ export default function App() {
   const [showLeftPatterns, setShowLeftPatterns]   = useState(true)
   const [showRightPatterns, setShowRightPatterns] = useState(true)
   const [showGaps, setShowGaps]                   = useState(false)
+  const [selectedMarkup, setSelectedMarkup]       = useState(null)
 
   // Refs
   const videoRef        = useRef(null)
@@ -162,6 +189,7 @@ export default function App() {
   const showGapsRef      = useRef(false)
   const s1TraceIdxRef    = useRef([])
   const s2TraceIdxRef    = useRef([])
+  const selectedMarkupRef = useRef(null)
 
   useEffect(() => { offsetS1Ref.current    = offsetS1     }, [offsetS1])
   useEffect(() => { offsetS2Ref.current    = offsetS2     }, [offsetS2])
@@ -170,6 +198,13 @@ export default function App() {
   useEffect(() => { currentFootRef.current = currentFoot  }, [currentFoot])
   useEffect(() => { selectedColsRef.current = selectedCols }, [selectedCols])
   useEffect(() => { showGapsRef.current = showGaps }, [showGaps])
+  useEffect(() => { selectedMarkupRef.current = selectedMarkup }, [selectedMarkup])
+
+  useEffect(() => {
+    if (!selectedMarkup) return
+    const contacts = selectedMarkup.foot === 'left' ? leftContacts : rightContacts
+    if (selectedMarkup.index >= contacts.length) setSelectedMarkup(null)
+  }, [leftContacts, rightContacts, selectedMarkup])
 
   // ── Auth ──────────────────────────────────────────────────────────────────
   const handleLogin = useCallback(async (e) => {
@@ -184,7 +219,7 @@ export default function App() {
       })
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}))
-        throw new Error(errData.detail || `Ошибка ${resp.status}`)
+        throw new Error(parseApiError(errData, resp.status))
       }
       const data = await resp.json()
       const tok = data.access_token || data.token
@@ -192,7 +227,11 @@ export default function App() {
       setToken(tok)
       sessionStorage.setItem('auth_token', tok)
     } catch (err) {
-      setLoginError(err.message)
+      if (err instanceof TypeError) {
+        setLoginError('API-сервер недоступен. Запустите backend на порту 8000.')
+      } else {
+        setLoginError(err.message)
+      }
     } finally {
       setAuthLoading(false)
     }
@@ -255,6 +294,7 @@ export default function App() {
     setShowSensor2(true)
     setShowGaps(false)
     setCheckHzData(null)
+    setSelectedMarkup(null)
 
     try {
       const resp = await fetch(`${API_BASE}/api/sessions/${sid}`, {
@@ -333,30 +373,47 @@ export default function App() {
     if (!chartDivRef.current || !plotInitRef.current) return
 
     const contactShapes = []
-    const pushContactShapes = (contacts, fillColor, lineColor) => {
+    const sm = selectedMarkupRef.current
+    const nSubplots = selectedColsRef.current.length || 1
+
+    const pushContactShapes = (contacts, fillColor, lineColor, foot) => {
+      const isSelectedFoot = sm?.foot === foot
       for (let i = 0; i + 1 < contacts.length; i += 2) {
         const x0 = Math.min(contacts[i], contacts[i + 1])
         const x1 = Math.max(contacts[i], contacts[i + 1])
+        const isSel = isSelectedFoot && (sm.index === i || sm.index === i + 1)
         contactShapes.push({
           type: 'rect', x0, x1,
           y0: 0, y1: 1, yref: 'paper',
-          fillcolor: fillColor,
-          line: { color: lineColor, width: 1.5 },
+          fillcolor: isSel ? SEL_FILL : fillColor,
+          line: { color: isSel ? SEL_LINE : lineColor, width: isSel ? 3 : 1.5 },
           layer: 'below',
         })
       }
       if (contacts.length % 2 === 1) {
-        const t = contacts[contacts.length - 1]
+        const i = contacts.length - 1
+        const t = contacts[i]
+        const isSel = isSelectedFoot && sm.index === i
         contactShapes.push({
           type: 'line', x0: t, x1: t,
           y0: 0, y1: 1, yref: 'paper',
-          line: { color: lineColor, width: 2, dash: 'dot' },
+          line: {
+            color: isSel ? SEL_LINE : lineColor,
+            width: isSel ? 3.5 : 2,
+            dash: isSel ? 'solid' : 'dot',
+          },
         })
       }
     }
 
-    if (showLeftRef.current)  pushContactShapes(leftContactsRef.current,  L_FILL, L_LINE)
-    if (showRightRef.current) pushContactShapes(rightContactsRef.current, R_FILL, R_LINE)
+    if (showLeftRef.current)  pushContactShapes(leftContactsRef.current,  L_FILL, L_LINE, 'left')
+    if (showRightRef.current) pushContactShapes(rightContactsRef.current, R_FILL, R_LINE, 'right')
+
+    if (sm) {
+      const contacts = sm.foot === 'left' ? leftContactsRef.current : rightContactsRef.current
+      const t = contacts[sm.index]
+      if (t != null) contactShapes.push(...buildSelectedPointShapes(t, nSubplots))
+    }
     contactShapesRef.current = contactShapes
 
     const gapShapes = []
@@ -402,7 +459,7 @@ export default function App() {
 
   useEffect(() => {
     if (plotInitRef.current && chartDivRef.current) updateOverlayShapes()
-  }, [showGaps, checkHzData, showSensor1, showSensor2, offsetS1, offsetS2, selectedCols, updateOverlayShapes])
+  }, [showGaps, checkHzData, showSensor1, showSensor2, offsetS1, offsetS2, selectedCols, selectedMarkup, updateOverlayShapes])
 
   useEffect(() => {
     if (!chartReady || !chartDivRef.current) return
@@ -425,7 +482,26 @@ export default function App() {
   const clearAllContacts = useCallback(() => {
     setLeftContacts([])
     setRightContacts([])
+    setSelectedMarkup(null)
   }, [])
+
+  const deleteSelectedMarkup = useCallback(() => {
+    if (!selectedMarkup) return
+    const { foot, index } = selectedMarkup
+    const pairStart = getPairStartIndex(index)
+    const removeInterval = (prev) => {
+      if (pairStart + 1 < prev.length) {
+        return prev.filter((_, i) => i !== pairStart && i !== pairStart + 1)
+      }
+      if (pairStart < prev.length) {
+        return prev.filter((_, i) => i !== pairStart)
+      }
+      return prev
+    }
+    if (foot === 'left') setLeftContacts(removeInterval)
+    else setRightContacts(removeInterval)
+    setSelectedMarkup(null)
+  }, [selectedMarkup])
 
   const exportLabels = useCallback(() => {
     if (!parquetData) return
@@ -586,6 +662,7 @@ export default function App() {
     setShowSensor2(true)
     setShowGaps(false)
     setCheckHzData(null)
+    setSelectedMarkup(null)
 
     try {
       const arrayBuffer = await file.arrayBuffer()
@@ -1223,30 +1300,67 @@ export default function App() {
                 {(leftContacts.length > 0 || rightContacts.length > 0) && (
                   <div className="zone-dur-block">
                     {[
-                      { contacts: leftContacts, cls: 'zone-dur-s1', label: 'S1' },
-                      { contacts: rightContacts, cls: 'zone-dur-s2', label: 'S2' },
-                    ].map(({ contacts, cls, label }) => contacts.length > 0 && (
+                      { contacts: leftContacts, cls: 'zone-dur-s1', label: 'S1', foot: 'left' },
+                      { contacts: rightContacts, cls: 'zone-dur-s2', label: 'S2', foot: 'right' },
+                    ].map(({ contacts, cls, label, foot }) => contacts.length > 0 && (
                       <div key={label} className="zone-dur-row">
                         <span className={`zone-dur-label ${cls}`}>{label}</span>
                         {Array.from({ length: Math.floor(contacts.length / 2) }, (_, i) => {
                           const t0 = contacts[i * 2]
                           const t1 = contacts[i * 2 + 1]
                           const dur = Math.abs(t1 - t0)
+                          const sel = selectedMarkup?.foot === foot && selectedMarkup.index === i * 2
                           return (
                             <span
                               key={i}
-                              className={`zone-dur-chip ${cls}`}
+                              className={`zone-dur-chip ${cls}${sel ? ' zone-dur-selected' : ''}`}
                               title={`${t0.toFixed(2)} → ${t1.toFixed(2)}`}
+                              onClick={() => setSelectedMarkup({ foot, index: i * 2 })}
                             >
                               #{i + 1}&thinsp;{formatDuration(dur, timeUnit)}
                             </span>
                           )
                         })}
                         {contacts.length % 2 === 1 && (
-                          <span className="zone-dur-chip zone-dur-pending">…2-я точка</span>
+                          <span
+                            className={`zone-dur-chip zone-dur-pending${
+                              selectedMarkup?.foot === foot && selectedMarkup.index === contacts.length - 1
+                                ? ' zone-dur-selected' : ''
+                            }`}
+                            onClick={() => setSelectedMarkup({ foot, index: contacts.length - 1 })}
+                          >
+                            …2-я точка
+                          </span>
                         )}
                       </div>
                     ))}
+                    <div className="zone-dur-actions">
+                      <button
+                        className="lab-btn danger"
+                        onClick={deleteSelectedMarkup}
+                        disabled={!selectedMarkup}
+                        title="Удалить выбранный интервал из списка"
+                      >
+                        ✕ Удалить выбранную
+                      </button>
+                      {selectedMarkup && (() => {
+                        const contacts = selectedMarkup.foot === 'left' ? leftContacts : rightContacts
+                        const pairStart = getPairStartIndex(selectedMarkup.index)
+                        const t0 = contacts[pairStart]
+                        if (t0 == null) return null
+                        const footLabel = selectedMarkup.foot === 'left' ? 'S1' : 'S2'
+                        const intervalNum = Math.floor(pairStart / 2) + 1
+                        const t1 = contacts[pairStart + 1]
+                        const hasPair = pairStart + 1 < contacts.length
+                        const fmt = (t) => timeUnit === 'ms' ? `${t.toFixed(0)} мс` : `${t.toFixed(3)} с`
+                        return (
+                          <span className="lab-stat lab-stat-selected">
+                            {footLabel} #{intervalNum}
+                            {hasPair ? `: ${fmt(t0)} → ${fmt(t1)}` : `: ${fmt(t0)} (1 точка)`}
+                          </span>
+                        )
+                      })()}
+                    </div>
                   </div>
                 )}
               </>
