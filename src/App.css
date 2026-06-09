@@ -515,6 +515,26 @@ body { background: var(--bg); overflow: hidden }
   color: var(--pc, var(--primary));
   opacity: 1;
 }
+
+.gap-vis-btn {
+  padding: 4px 12px;
+  border: 1.5px solid #fca5a5;
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text2);
+  font-size: 12px; font-weight: 600;
+  cursor: pointer;
+  transition: all .12s;
+  white-space: nowrap;
+}
+.gap-vis-btn:hover:not(:disabled) { background: #fef2f2; color: var(--red) }
+.gap-vis-btn.vis-on {
+  background: #fef2f2;
+  border-color: var(--red);
+  color: var(--red);
+}
+.gap-vis-btn:disabled { opacity: .4; cursor: not-allowed }
+
 .foot-btn {
   display: flex; align-items: center; gap: 3px;
   padding: 3px 10px;

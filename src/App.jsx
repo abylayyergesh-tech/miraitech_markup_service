@@ -4,7 +4,7 @@ import { parquetReadObjects } from 'hyparquet'
 import './App.css'
 
 // ── Constants ──────────────────────────────────────────────────────────────
-const API_BASE = 'https://api.miraitech.health'
+const API_BASE = 'http://localhost:8000'
 
 const PALETTE = [
   '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
@@ -20,6 +20,28 @@ const L_FILL = 'rgba(31,119,180,0.35)'
 const R_FILL = 'rgba(255,127,14,0.35)'
 const L_LINE = 'rgba(31,119,180,0.9)'
 const R_LINE = 'rgba(255,127,14,0.9)'
+const GAP_FILL = 'rgba(220,53,69,0.35)'
+const GAP_LINE = 'rgba(220,53,69,0.92)'
+
+function buildGapBandShapes(intervals, nSubplots) {
+  if (!intervals.length || nSubplots < 1) return []
+  const shapes = []
+  for (const [x0, x1] of intervals) {
+    for (let i = 0; i < nSubplots; i++) {
+      shapes.push({
+        type: 'rect',
+        x0, x1,
+        xref: 'x',
+        y0: 0, y1: 1,
+        yref: i === 0 ? 'y domain' : `y${i + 1} domain`,
+        fillcolor: GAP_FILL,
+        line: { color: GAP_LINE, width: 1.5 },
+        layer: 'below',
+      })
+    }
+  }
+  return shapes
+}
 
 function safeNum(v) {
   if (v === null || v === undefined) return null
@@ -110,6 +132,7 @@ export default function App() {
   const [rightContacts, setRightContacts]         = useState([])
   const [showLeftPatterns, setShowLeftPatterns]   = useState(true)
   const [showRightPatterns, setShowRightPatterns] = useState(true)
+  const [showGaps, setShowGaps]                   = useState(false)
 
   // Refs
   const videoRef        = useRef(null)
@@ -123,6 +146,7 @@ export default function App() {
   const lastTRef        = useRef(null)
   const plotInitRef      = useRef(false)
   const contactShapesRef = useRef([])
+  const gapShapesRef     = useRef([])
   const cursorShapesRef  = useRef([])
   const selectedColsRef  = useRef([])
   const isDragging       = useRef(false)
@@ -135,6 +159,7 @@ export default function App() {
   const rightContactsRef = useRef([])
   const showLeftRef      = useRef(true)
   const showRightRef     = useRef(true)
+  const showGapsRef      = useRef(false)
   const s1TraceIdxRef    = useRef([])
   const s2TraceIdxRef    = useRef([])
 
@@ -144,6 +169,7 @@ export default function App() {
   useEffect(() => { labelingRef.current    = labelingMode }, [labelingMode])
   useEffect(() => { currentFootRef.current = currentFoot  }, [currentFoot])
   useEffect(() => { selectedColsRef.current = selectedCols }, [selectedCols])
+  useEffect(() => { showGapsRef.current = showGaps }, [showGaps])
 
   // ── Auth ──────────────────────────────────────────────────────────────────
   const handleLogin = useCallback(async (e) => {
@@ -227,6 +253,7 @@ export default function App() {
     setShowRightPatterns(true)
     setShowSensor1(true)
     setShowSensor2(true)
+    setShowGaps(false)
     setCheckHzData(null)
 
     try {
@@ -296,16 +323,21 @@ export default function App() {
     }
   }, [token, sessionId])
 
-  // ── Contact shapes ────────────────────────────────────────────────────────
-  const updateContactShapes = useCallback(() => {
-    if (!chartDivRef.current || !plotInitRef.current) return
-    const shapes = []
+  const totalGaps = useMemo(() => {
+    if (!checkHzData) return 0
+    return Object.values(checkHzData).reduce((n, s) => n + (s.gaps?.length || 0), 0)
+  }, [checkHzData])
 
-    const pushShapes = (contacts, fillColor, lineColor) => {
+  // ── Contact + gap shapes ──────────────────────────────────────────────────
+  const updateOverlayShapes = useCallback(() => {
+    if (!chartDivRef.current || !plotInitRef.current) return
+
+    const contactShapes = []
+    const pushContactShapes = (contacts, fillColor, lineColor) => {
       for (let i = 0; i + 1 < contacts.length; i += 2) {
         const x0 = Math.min(contacts[i], contacts[i + 1])
         const x1 = Math.max(contacts[i], contacts[i + 1])
-        shapes.push({
+        contactShapes.push({
           type: 'rect', x0, x1,
           y0: 0, y1: 1, yref: 'paper',
           fillcolor: fillColor,
@@ -315,7 +347,7 @@ export default function App() {
       }
       if (contacts.length % 2 === 1) {
         const t = contacts[contacts.length - 1]
-        shapes.push({
+        contactShapes.push({
           type: 'line', x0: t, x1: t,
           y0: 0, y1: 1, yref: 'paper',
           line: { color: lineColor, width: 2, dash: 'dot' },
@@ -323,23 +355,54 @@ export default function App() {
       }
     }
 
-    if (showLeftRef.current)  pushShapes(leftContactsRef.current,  L_FILL, L_LINE)
-    if (showRightRef.current) pushShapes(rightContactsRef.current, R_FILL, R_LINE)
-    contactShapesRef.current = shapes
-    Plotly.relayout(chartDivRef.current, { shapes: [...cursorShapesRef.current, ...shapes] })
-  }, [])
+    if (showLeftRef.current)  pushContactShapes(leftContactsRef.current,  L_FILL, L_LINE)
+    if (showRightRef.current) pushContactShapes(rightContactsRef.current, R_FILL, R_LINE)
+    contactShapesRef.current = contactShapes
+
+    const gapShapes = []
+    if (showGapsRef.current && checkHzData) {
+      const seen = new Set()
+      const intervals = []
+      sensorNames.forEach((name, i) => {
+        const visible = i === 0 ? showSensor1 : showSensor2
+        if (!visible) return
+        const gaps = checkHzData[name]?.gaps
+        if (!gaps?.length) return
+        const shift = i === 0 ? offsetS1Ref.current : offsetS2Ref.current
+        for (const [startT, endT] of gaps) {
+          const x0 = Math.min(startT, endT) / 1000 + shift
+          const x1 = Math.max(startT, endT) / 1000 + shift
+          const key = `${x0}|${x1}`
+          if (seen.has(key)) continue
+          seen.add(key)
+          intervals.push([x0, x1])
+        }
+      })
+      const nSubplots = selectedColsRef.current.length || 1
+      gapShapes.push(...buildGapBandShapes(intervals, nSubplots))
+    }
+    gapShapesRef.current = gapShapes
+
+    Plotly.relayout(chartDivRef.current, {
+      shapes: [...gapShapesRef.current, ...contactShapesRef.current, ...cursorShapesRef.current],
+    })
+  }, [showGaps, checkHzData, sensorNames, showSensor1, showSensor2])
 
   useEffect(() => {
     leftContactsRef.current  = leftContacts
     rightContactsRef.current = rightContacts
-    if (plotInitRef.current && chartDivRef.current) updateContactShapes()
-  }, [leftContacts, rightContacts, updateContactShapes])
+    if (plotInitRef.current && chartDivRef.current) updateOverlayShapes()
+  }, [leftContacts, rightContacts, updateOverlayShapes])
 
   useEffect(() => {
     showLeftRef.current  = showLeftPatterns
     showRightRef.current = showRightPatterns
-    if (plotInitRef.current && chartDivRef.current) updateContactShapes()
-  }, [showLeftPatterns, showRightPatterns, updateContactShapes])
+    if (plotInitRef.current && chartDivRef.current) updateOverlayShapes()
+  }, [showLeftPatterns, showRightPatterns, updateOverlayShapes])
+
+  useEffect(() => {
+    if (plotInitRef.current && chartDivRef.current) updateOverlayShapes()
+  }, [showGaps, checkHzData, showSensor1, showSensor2, offsetS1, offsetS2, selectedCols, updateOverlayShapes])
 
   useEffect(() => {
     if (!chartReady || !chartDivRef.current) return
@@ -521,6 +584,8 @@ export default function App() {
     setShowRightPatterns(true)
     setShowSensor1(true)
     setShowSensor2(true)
+    setShowGaps(false)
+    setCheckHzData(null)
 
     try {
       const arrayBuffer = await file.arrayBuffer()
@@ -662,6 +727,7 @@ export default function App() {
 
     cursorShapesRef.current  = buildCursorShapes(xMin, n)
     contactShapesRef.current = []
+    gapShapesRef.current     = []
     lastTRef.current         = null
     plotInitRef.current      = false
 
@@ -710,7 +776,7 @@ export default function App() {
     }).then(() => {
       plotInitRef.current = true
       setChartReady(true)
-      updateContactShapes()
+      updateOverlayShapes()
       chartDivRef.current.on('plotly_click', (d) => {
         if (!d?.points?.length) return
         const t = d.points[0].x
@@ -723,7 +789,7 @@ export default function App() {
         }
       })
     })
-  }, [parquetData, selectedCols, timeCol, sensorNames, offsetS1, offsetS2, updateContactShapes])
+  }, [parquetData, selectedCols, timeCol, sensorNames, offsetS1, offsetS2, updateOverlayShapes])
 
   // ── Video timeupdate → move chart cursor ──────────────────────────────────
   const handleTimeUpdate = useCallback(() => {
@@ -744,7 +810,9 @@ export default function App() {
     const n = selectedColsRef.current.length
     if (n === 0) return
     cursorShapesRef.current = buildCursorShapes(imuT, n)
-    Plotly.relayout(chartDivRef.current, { shapes: [...cursorShapesRef.current, ...contactShapesRef.current] })
+    Plotly.relayout(chartDivRef.current, {
+      shapes: [...gapShapesRef.current, ...contactShapesRef.current, ...cursorShapesRef.current],
+    })
   }, [])
 
   // ── Timeline drag ─────────────────────────────────────────────────────────
@@ -1078,6 +1146,23 @@ export default function App() {
               title={labelingMode ? 'Выключить режим разметки' : 'Включить режим разметки'}
             >
               ✏ {labelingMode ? 'Разметка вкл' : 'Разметка'}
+            </button>
+
+            <button
+              className={`gap-vis-btn${showGaps ? ' vis-on' : ''}`}
+              onClick={() => setShowGaps(v => !v)}
+              disabled={!checkHzData || totalGaps === 0 || !chartReady}
+              title={
+                !checkHzData
+                  ? 'Загрузите сессию для анализа пропусков'
+                  : totalGaps === 0
+                    ? 'Пропусков в данных не обнаружено'
+                    : showGaps
+                      ? 'Скрыть пропуски на графике'
+                      : `Показать ${totalGaps} пропуск(ов) красными отрезками`
+              }
+            >
+              {showGaps ? '●' : '○'}&nbsp;Пропуски{totalGaps > 0 ? ` (${totalGaps})` : ''}
             </button>
 
             {totalContacts > 0 && (
