@@ -265,6 +265,18 @@ body { background: var(--bg); overflow: hidden }
 .btn-build:hover    { background: #1d4ed8 }
 .btn-build:disabled { opacity: .4; cursor: not-allowed }
 
+.btn-unwrap {
+  padding: 5px 14px;
+  background: #f3f4f6; color: #374151;
+  border: 1.5px solid #d1d5db; border-radius: 6px;
+  font-size: 13px; font-weight: 600; cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.btn-unwrap:hover    { background: #e5e7eb; border-color: #9ca3af }
+.btn-unwrap.active   { background: #ede9fe; color: #6d28d9; border-color: #a78bfa }
+.btn-unwrap.active:hover { background: #ddd6fe }
+.btn-unwrap:disabled { opacity: .4; cursor: not-allowed }
+
 /* ── Content area: side-by-side ─────────────────────────────────────── */
 .content {
   flex: 1;
