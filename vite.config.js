@@ -7,7 +7,7 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: process.env.VITE_API_PROXY || 'http://localhost:8000',
+        target: process.env.VITE_API_PROXY || 'http:api.miraitech.health',
         changeOrigin: true,
       },
     },
