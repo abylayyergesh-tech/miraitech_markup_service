@@ -4,7 +4,7 @@ import { parquetReadObjects } from 'hyparquet'
 import './App.css'
 
 // ── Constants ──────────────────────────────────────────────────────────────
-const API_BASE = import.meta.env.VITE_API_BASE ?? ''
+const API_BASE = import.meta.env.VITE_API_BASE ?? 'https://api.miraitech.health'
 
 function parseApiError(errData, status) {
   const detail = errData?.detail
@@ -23,9 +23,17 @@ const NON_DATA_COLS = new Set([
   'target', 'Target', 'label', 'Label',
 ])
 const PREFERRED_COLS = ['AcX', 'AcY', 'AcZ', 'XData', 'YData', 'ZData', 'GravityZ']
+const TURN_COL = 'XData'
+const TURN_MIN_CHANGE_DEG = 60
+const TURN_ENTER_MAX_MS = 300
+const TURN_MAX_DURATION_MS = 700
+const TURN_EXIT_SLOW_MS = 30
+const TURN_FAST_RATE_DEG_PER_MS = TURN_MIN_CHANGE_DEG / TURN_ENTER_MAX_MS
 
 const L_FILL = 'rgba(31,119,180,0.35)'
 const R_FILL = 'rgba(255,127,14,0.35)'
+const L_TURN_FILL = 'rgba(31,119,180,0.5)'
+const R_TURN_FILL = 'rgba(255,127,14,0.5)'
 const L_LINE = 'rgba(31,119,180,0.9)'
 const R_LINE = 'rgba(255,127,14,0.9)'
 const GAP_FILL = 'rgba(220,53,69,0.35)'
@@ -33,7 +41,7 @@ const GAP_LINE = 'rgba(220,53,69,0.92)'
 const SEL_FILL = 'rgba(234,179,8,0.5)'
 const SEL_LINE = '#ca8a04'
 
-function buildGapBandShapes(intervals, nSubplots) {
+function buildBandShapes(intervals, nSubplots, fillcolor, linecolor) {
   if (!intervals.length || nSubplots < 1) return []
   const shapes = []
   for (const [x0, x1] of intervals) {
@@ -44,14 +52,240 @@ function buildGapBandShapes(intervals, nSubplots) {
         xref: 'x',
         y0: 0, y1: 1,
         yref: i === 0 ? 'y domain' : `y${i + 1} domain`,
-        fillcolor: GAP_FILL,
-        line: { color: GAP_LINE, width: 1.5 },
+        fillcolor,
+        line: { color: linecolor, width: 1.5 },
         layer: 'below',
       })
     }
   }
   return shapes
 }
+
+function buildTurnBandShapesForSubplot(intervals, subplotIdx, fillcolor, linecolor) {
+  if (!intervals.length || subplotIdx < 0) return []
+  const yref = subplotIdx === 0 ? 'y domain' : `y${subplotIdx + 1} domain`
+  const shapes = []
+  for (let [x0, x1] of intervals) {
+    if (x1 < x0) [x0, x1] = [x1, x0]
+    if (x1 <= x0) continue
+    shapes.push({
+      type: 'rect',
+      x0, x1,
+      xref: 'x',
+      y0: 0, y1: 1,
+      yref,
+      fillcolor,
+      line: { color: linecolor, width: 0 },
+      layer: 'below',
+    })
+  }
+  return shapes
+}
+
+function buildGapBandShapes(intervals, nSubplots) {
+  return buildBandShapes(intervals, nSubplots, GAP_FILL, GAP_LINE)
+}
+
+function resolveTurnCols(allCols) {
+  const match = allCols.find(c => c.toLowerCase() === TURN_COL.toLowerCase())
+  return match ? [match] : []
+}
+
+function sortSensorDataByTime(data, timeCol) {
+  const tArr = data[timeCol] || []
+  const indices = tArr
+    .map((_, i) => i)
+    .filter(i => safeNum(tArr[i]) !== null)
+    .sort((a, b) => safeNum(tArr[a]) - safeNum(tArr[b]))
+  const sorted = {}
+  Object.entries(data).forEach(([k, arr]) => {
+    sorted[k] = indices.map(i => arr[i])
+  })
+  return sorted
+}
+
+function prepareSensorTurnData(parquetData, sensorName, sensorIndex, timeCol, angleCols) {
+  const filtered = filterParquetBySensor(parquetData, sensorName, sensorIndex)
+  const sorted = sortSensorDataByTime(filtered, timeCol)
+  const availCols = angleCols.filter(c => sorted[c]?.length)
+  if (!availCols.length || !(sorted[timeCol] || []).length) return null
+
+  return { data: sorted, timeArr: sorted[timeCol], availCols }
+}
+
+function filterParquetBySensor(parquetData, sensorName, sensorIndex = -1) {
+  const nameArr = parquetData?.Name
+  if (!nameArr) return parquetData
+
+  const uniqueNames = [...new Set(nameArr.filter(v => v != null && v !== ''))].sort((a, b) =>
+    a.localeCompare(b),
+  )
+
+  let targetName = sensorName
+  if (!targetName && sensorIndex >= 0) targetName = uniqueNames[sensorIndex] || ''
+  if (!targetName) return parquetData
+
+  let mask = nameArr.map(v => v === targetName)
+  if (!mask.some(Boolean)) {
+    const suffix = String(targetName).match(/Sensor[_ ]?(\d+)/i)?.[1]
+    if (suffix) {
+      mask = nameArr.map(v => new RegExp(`Sensor[_ ]?${suffix}\\b`, 'i').test(String(v)))
+    }
+  }
+  if (!mask.some(Boolean) && sensorIndex >= 0 && uniqueNames[sensorIndex]) {
+    mask = nameArr.map(v => v === uniqueNames[sensorIndex])
+  }
+
+  const out = {}
+  Object.entries(parquetData).forEach(([k, arr]) => {
+    out[k] = arr.filter((_, i) => mask[i])
+  })
+  return out
+}
+
+function prepareAxisSeriesForTurns(values) {
+  return unwrapAngleDegrees(values || [])
+}
+
+function inferTimeIsMs(timeArr) {
+  const vals = (timeArr || []).map(safeNum).filter(v => v !== null)
+  if (!vals.length) return true
+  return Math.max(...vals) > 3600
+}
+
+function windowDurationUnits(isMs, ms) {
+  return isMs ? ms : ms / 1000
+}
+
+function sampleRateDegPerUnit(series, timeArr, i) {
+  if (i <= 0) return 0
+  const t0 = safeNum(timeArr[i - 1])
+  const t1 = safeNum(timeArr[i])
+  const v0 = safeNum(series[i - 1])
+  const v1 = safeNum(series[i])
+  if (t0 === null || t1 === null || v0 === null || v1 === null) return 0
+  const dt = t1 - t0
+  if (dt <= 0) return 0
+  return Math.abs(v1 - v0) / dt
+}
+
+function findEnterStartIdx(series, timeArr, i, maxMs, minDeg, isMs) {
+  const maxUnits = windowDurationUnits(isMs, maxMs)
+  const tEnd = safeNum(timeArr[i])
+  const vEnd = safeNum(series[i])
+  if (tEnd === null || vEnd === null) return -1
+
+  let startIdx = -1
+  for (let j = i - 1; j >= 0; j--) {
+    const tStart = safeNum(timeArr[j])
+    const vStart = safeNum(series[j])
+    if (tStart === null || vStart === null) continue
+    if (tEnd - tStart > maxUnits) break
+    if (Math.abs(vEnd - vStart) >= minDeg) startIdx = j
+  }
+  return startIdx
+}
+
+function mergeTurnIntervals(intervals) {
+  if (!intervals.length) return []
+  const sorted = [...intervals].sort((a, b) => a[0] - b[0])
+  const merged = [sorted[0]]
+  for (let i = 1; i < sorted.length; i++) {
+    const [x0, x1] = sorted[i]
+    const last = merged[merged.length - 1]
+    if (x0 <= last[1]) last[1] = Math.max(last[1], x1)
+    else merged.push([x0, x1])
+  }
+  return merged
+}
+
+function detectTurnIntervalsForColumn(timeArr, data, col, timeShift = 0) {
+  if (!timeArr?.length || !data[col]?.length) return []
+
+  const series = prepareAxisSeriesForTurns(data[col])
+  const isMs = inferTimeIsMs(timeArr)
+  const exitSlowUnits = windowDurationUnits(isMs, TURN_EXIT_SLOW_MS)
+  const maxDurUnits = windowDurationUnits(isMs, TURN_MAX_DURATION_MS)
+
+  let startIdx = -1
+  for (let i = 0; i < series.length; i++) {
+    if (safeNum(series[i]) !== null) { startIdx = i; break }
+  }
+  if (startIdx < 0) return []
+
+  const intervals = []
+  let inTurn = false
+  let turnStartIdx = -1
+  let slowAccum = 0
+
+  const tryCloseTurn = (endIdx) => {
+    const t0 = safeNum(timeArr[turnStartIdx])
+    let t1 = safeNum(timeArr[endIdx])
+    if (t0 !== null && t1 !== null) {
+      t1 = Math.min(t1, t0 + maxDurUnits)
+      if (t1 > t0) intervals.push([t0 + timeShift, t1 + timeShift])
+    }
+  }
+
+  const closeTurn = (endIdx) => {
+    tryCloseTurn(endIdx)
+    inTurn = false
+    turnStartIdx = -1
+    slowAccum = 0
+  }
+
+  for (let i = startIdx; i < series.length; i++) {
+    if (!inTurn) {
+      const enterIdx = findEnterStartIdx(
+        series, timeArr, i, TURN_ENTER_MAX_MS, TURN_MIN_CHANGE_DEG, isMs,
+      )
+      if (enterIdx >= 0) {
+        inTurn = true
+        turnStartIdx = enterIdx
+        slowAccum = 0
+      }
+    } else {
+      const t0 = safeNum(timeArr[turnStartIdx])
+      const t1 = safeNum(timeArr[i])
+      if (t0 !== null && t1 !== null && t1 - t0 >= maxDurUnits) {
+        closeTurn(i)
+        continue
+      }
+
+      if (i > 0) {
+        const rate = sampleRateDegPerUnit(series, timeArr, i)
+        const dt = safeNum(timeArr[i]) - safeNum(timeArr[i - 1])
+        if (dt !== null && dt > 0) {
+          if (rate < TURN_FAST_RATE_DEG_PER_MS) slowAccum += dt
+          else slowAccum = 0
+
+          if (slowAccum >= exitSlowUnits) closeTurn(i)
+        }
+      }
+    }
+  }
+
+  if (inTurn && turnStartIdx >= 0) {
+    tryCloseTurn(series.length - 1)
+  }
+
+  return mergeTurnIntervals(intervals)
+}
+
+function detectTurnIntervalsByColumn(timeArr, data, angleCols, timeShift = 0) {
+  const byCol = {}
+  for (const col of angleCols) {
+    if (!data[col]?.length) continue
+    byCol[col] = detectTurnIntervalsForColumn(timeArr, data, col, timeShift)
+  }
+  return byCol
+}
+
+function countTurnIntervals(byCol) {
+  return Object.values(byCol || {}).reduce((n, ivs) => n + (ivs?.length || 0), 0)
+}
+
+const EMPTY_TURN_INTERVALS = { left: {}, right: {} }
 
 function safeNum(v) {
   if (v === null || v === undefined) return null
@@ -176,6 +410,7 @@ export default function App() {
   const [showLeftPatterns, setShowLeftPatterns]   = useState(true)
   const [showRightPatterns, setShowRightPatterns] = useState(true)
   const [showGaps, setShowGaps]                   = useState(false)
+  const [showTurns, setShowTurns]                 = useState(false)
   const [selectedMarkup, setSelectedMarkup]       = useState(null)
   const [anglesUnwrapped, setAnglesUnwrapped]     = useState(false)
 
@@ -192,6 +427,8 @@ export default function App() {
   const plotInitRef      = useRef(false)
   const contactShapesRef = useRef([])
   const gapShapesRef     = useRef([])
+  const turnShapesRef    = useRef([])
+  const turnIntervalsRef = useRef(EMPTY_TURN_INTERVALS)
   const cursorShapesRef  = useRef([])
   const selectedColsRef  = useRef([])
   const anglesUnwrappedRef = useRef(false)
@@ -206,6 +443,7 @@ export default function App() {
   const showLeftRef      = useRef(true)
   const showRightRef     = useRef(true)
   const showGapsRef      = useRef(false)
+  const showTurnsRef     = useRef(false)
   const s1TraceIdxRef    = useRef([])
   const s2TraceIdxRef    = useRef([])
   const selectedMarkupRef = useRef(null)
@@ -217,6 +455,7 @@ export default function App() {
   useEffect(() => { currentFootRef.current = currentFoot  }, [currentFoot])
   useEffect(() => { selectedColsRef.current = selectedCols }, [selectedCols])
   useEffect(() => { showGapsRef.current = showGaps }, [showGaps])
+  useEffect(() => { showTurnsRef.current = showTurns }, [showTurns])
   useEffect(() => { anglesUnwrappedRef.current = anglesUnwrapped }, [anglesUnwrapped])
   useEffect(() => { selectedMarkupRef.current = selectedMarkup }, [selectedMarkup])
 
@@ -313,6 +552,7 @@ export default function App() {
     setShowSensor1(true)
     setShowSensor2(true)
     setShowGaps(false)
+    setShowTurns(false)
     setCheckHzData(null)
     setSelectedMarkup(null)
     anglesUnwrappedRef.current = false
@@ -390,6 +630,39 @@ export default function App() {
     return Object.values(checkHzData).reduce((n, s) => n + (s.gaps?.length || 0), 0)
   }, [checkHzData])
 
+  const turnColsResolved = useMemo(() => resolveTurnCols(columns), [columns])
+  const hasTurnCol = turnColsResolved.length > 0
+
+  const turnIntervals = useMemo(() => {
+    if (!parquetData || !hasTurnCol) return EMPTY_TURN_INTERVALS
+    const sensor1Name = sensorNames[0] || ''
+    const sensor2Name = sensorNames.length > 1 ? sensorNames[1] : ''
+
+    const computeForSensor = (sensorName, shift, sensorIndex) => {
+      const prepared = prepareSensorTurnData(
+        parquetData, sensorName, sensorIndex, timeCol, turnColsResolved,
+      )
+      if (!prepared) return {}
+      return detectTurnIntervalsByColumn(
+        prepared.timeArr,
+        prepared.data,
+        prepared.availCols,
+        shift,
+      )
+    }
+
+    return {
+      left: computeForSensor(sensor1Name, offsetS1, 0),
+      right: sensor2Name ? computeForSensor(sensor2Name, offsetS2, 1) : {},
+    }
+  }, [parquetData, turnColsResolved, hasTurnCol, sensorNames, timeCol, offsetS1, offsetS2])
+
+  const totalTurns = countTurnIntervals(turnIntervals.left) + countTurnIntervals(turnIntervals.right)
+
+  useEffect(() => {
+    turnIntervalsRef.current = turnIntervals
+  }, [turnIntervals])
+
   // ── Contact + gap shapes ──────────────────────────────────────────────────
   const updateOverlayShapes = useCallback(() => {
     if (!chartDivRef.current || !plotInitRef.current) return
@@ -462,10 +735,36 @@ export default function App() {
     }
     gapShapesRef.current = gapShapes
 
+    const turns = turnIntervalsRef.current
+    const turnShapes = []
+    if (showTurnsRef.current) {
+      selectedColsRef.current.forEach((col, subplotIdx) => {
+        if (col.toLowerCase() !== TURN_COL.toLowerCase()) return
+        const leftKey = Object.keys(turns.left).find(k => k.toLowerCase() === col.toLowerCase())
+        const rightKey = Object.keys(turns.right).find(k => k.toLowerCase() === col.toLowerCase())
+        if (showSensor1 && leftKey && turns.left[leftKey]?.length) {
+          turnShapes.push(
+            ...buildTurnBandShapesForSubplot(turns.left[leftKey], subplotIdx, L_TURN_FILL, L_LINE),
+          )
+        }
+        if (showSensor2 && rightKey && turns.right[rightKey]?.length) {
+          turnShapes.push(
+            ...buildTurnBandShapesForSubplot(turns.right[rightKey], subplotIdx, R_TURN_FILL, R_LINE),
+          )
+        }
+      })
+    }
+    turnShapesRef.current = turnShapes
+
     Plotly.relayout(chartDivRef.current, {
-      shapes: [...gapShapesRef.current, ...contactShapesRef.current, ...cursorShapesRef.current],
+      shapes: [
+        ...turnShapesRef.current,
+        ...gapShapesRef.current,
+        ...contactShapesRef.current,
+        ...cursorShapesRef.current,
+      ],
     })
-  }, [showGaps, checkHzData, sensorNames, showSensor1, showSensor2])
+  }, [showGaps, showTurns, checkHzData, sensorNames, showSensor1, showSensor2])
 
   useEffect(() => {
     leftContactsRef.current  = leftContacts
@@ -481,7 +780,7 @@ export default function App() {
 
   useEffect(() => {
     if (plotInitRef.current && chartDivRef.current) updateOverlayShapes()
-  }, [showGaps, checkHzData, showSensor1, showSensor2, offsetS1, offsetS2, selectedCols, selectedMarkup, updateOverlayShapes])
+  }, [showGaps, showTurns, checkHzData, showSensor1, showSensor2, offsetS1, offsetS2, selectedCols, selectedMarkup, turnIntervals, updateOverlayShapes])
 
   useEffect(() => {
     if (!chartReady || !chartDivRef.current) return
@@ -683,6 +982,7 @@ export default function App() {
     setShowSensor1(true)
     setShowSensor2(true)
     setShowGaps(false)
+    setShowTurns(false)
     setCheckHzData(null)
     setSelectedMarkup(null)
     anglesUnwrappedRef.current = false
@@ -835,6 +1135,7 @@ export default function App() {
     cursorShapesRef.current  = buildCursorShapes(xMin, n)
     contactShapesRef.current = []
     gapShapesRef.current     = []
+    turnShapesRef.current    = []
     lastTRef.current         = null
     plotInitRef.current      = false
 
@@ -925,7 +1226,12 @@ export default function App() {
     if (n === 0) return
     cursorShapesRef.current = buildCursorShapes(imuT, n)
     Plotly.relayout(chartDivRef.current, {
-      shapes: [...gapShapesRef.current, ...contactShapesRef.current, ...cursorShapesRef.current],
+      shapes: [
+        ...turnShapesRef.current,
+        ...gapShapesRef.current,
+        ...contactShapesRef.current,
+        ...cursorShapesRef.current,
+      ],
     })
   }, [])
 
@@ -1176,6 +1482,24 @@ export default function App() {
               title={anglesUnwrapped ? 'Вернуть исходные углы' : 'Развернуть углы (убрать скачки ±360°)'}
             >
               ↺ {anglesUnwrapped ? 'Углы развёрнуты' : 'Развернуть углы'}
+            </button>
+            <button
+              className={`btn-unwrap turn-vis-btn${showTurns ? ' active' : ''}`}
+              onClick={() => setShowTurns(v => !v)}
+              disabled={!hasTurnCol || !chartReady}
+              title={
+                !hasTurnCol
+                  ? 'Нет колонки XData для анализа разворотов'
+                  : !chartReady
+                    ? 'Сначала постройте график'
+                    : totalTurns === 0
+                      ? 'Разворотов не обнаружено (≥60° за ≤300 мс)'
+                      : showTurns
+                        ? 'Скрыть развороты на графике'
+                        : `Показать ${totalTurns} разворот(ов): S1 — синий, S2 — оранжевый`
+              }
+            >
+              {showTurns ? '●' : '○'}&nbsp;Показать развороты{totalTurns > 0 ? ` (${totalTurns})` : ''}
             </button>
             <button className="btn-build" disabled={!selectedCols.length} onClick={renderChart}>
               ▶ Построить

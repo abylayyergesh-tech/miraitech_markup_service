@@ -557,6 +557,15 @@ body { background: var(--bg); overflow: hidden }
 }
 .gap-vis-btn:disabled { opacity: .4; cursor: not-allowed }
 
+.btn-unwrap.turn-vis-btn.active {
+  background: linear-gradient(90deg, rgba(31,119,180,0.14) 0%, rgba(255,127,14,0.14) 100%);
+  color: #1e40af;
+  border-color: #60a5fa;
+}
+.btn-unwrap.turn-vis-btn.active:hover {
+  background: linear-gradient(90deg, rgba(31,119,180,0.22) 0%, rgba(255,127,14,0.22) 100%);
+}
+
 .foot-btn {
   display: flex; align-items: center; gap: 3px;
   padding: 3px 10px;
