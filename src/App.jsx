@@ -23,6 +23,82 @@ const NON_DATA_COLS = new Set([
   'target', 'Target', 'label', 'Label',
 ])
 const PREFERRED_COLS = ['AcX', 'AcY', 'AcZ', 'XData', 'YData', 'ZData', 'GravityZ']
+const SPEED_TRACKER = 'ESP32_SpeedTracker'
+const ST_COLOR = '#2ca02c'
+const ST_COL_NAMES = ['Distance', 'Speed', 'DistanceM', 'VelocityMs']
+const ST_ONLY_COLS = new Set(ST_COL_NAMES)
+
+function parseSessionRows(raw) {
+  if (Array.isArray(raw)) return raw
+  if (typeof raw !== 'string') throw new Error('Некорректные данные сессии')
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return JSON.parse(
+      raw
+        .replace(/\bNaN\b/g, 'null')
+        .replace(/\b-?Infinity\b/g, 'null')
+    )
+  }
+}
+
+function rowsToColMap(rows) {
+  const colMap = {}
+  Object.keys(rows[0]).forEach(k => { colMap[k] = [] })
+  rows.forEach(row => Object.entries(row).forEach(([k, v]) => colMap[k].push(v)))
+  return colMap
+}
+
+function detectTimeCol(allCols) {
+  return allCols.find(c => c === 'Time')
+    || allCols.find(c => ['time', 'timestamp', 'Timestamp', 't'].includes(c))
+    || allCols[0]
+}
+
+function computeNumericColumns(colMap, tCol) {
+  return Object.keys(colMap).filter(c => {
+    if (NON_DATA_COLS.has(c) || c === tCol) return false
+    return (colMap[c] || []).some(v => safeNum(v) !== null)
+  })
+}
+
+function sortSensorNames(colMap) {
+  if (!colMap['Name']) return []
+  return [...new Set(colMap['Name'].filter(v => v != null && v !== ''))]
+    .sort((a, b) => a.localeCompare(b))
+}
+
+function computeAutoOffsetST(colMap, timeCol, insoleNames) {
+  if (!insoleNames.length || !colMap[timeCol] || !colMap['Name']) return 0
+  const times = colMap[timeCol]
+  const names = colMap['Name']
+  let insoleMin = Infinity
+  let stMin = Infinity
+  for (let i = 0; i < times.length; i++) {
+    const t = safeNum(times[i])
+    if (t === null) continue
+    const n = names[i]
+    if (n === SPEED_TRACKER) { if (t < stMin) stMin = t }
+    else if (insoleNames.includes(n)) { if (t < insoleMin) insoleMin = t }
+  }
+  if (!isFinite(insoleMin) || !isFinite(stMin)) return 0
+  return insoleMin - stMin
+}
+
+function resolveStDataCol(data, col) {
+  if ((data[col] || []).some(v => safeNum(v) !== null)) return col
+  const alt = { Distance: 'DistanceM', Speed: 'VelocityMs', DistanceM: 'Distance', VelocityMs: 'Speed' }[col]
+  if (alt && (data[alt] || []).some(v => safeNum(v) !== null)) return alt
+  return col
+}
+
+function buildDefaultCols(numCols, hasSpeedTracker) {
+  const imu = PREFERRED_COLS.filter(c => numCols.includes(c)).slice(0, 3)
+  const st  = hasSpeedTracker ? ST_COL_NAMES.filter(c => numCols.includes(c)) : []
+  const merged = [...imu]
+  st.forEach(c => { if (!merged.includes(c)) merged.push(c) })
+  return merged.length ? merged : numCols.slice(0, 3)
+}
 
 const L_FILL = 'rgba(31,119,180,0.35)'
 const R_FILL = 'rgba(255,127,14,0.35)'
@@ -147,11 +223,13 @@ export default function App() {
   const [sensorNames, setSensorNames]   = useState([])
   const [showSensor1, setShowSensor1]   = useState(true)
   const [showSensor2, setShowSensor2]   = useState(true)
+  const [showSpeedTracker, setShowSpeedTracker] = useState(false)
   const [checkHzData, setCheckHzData]   = useState(null)
   const [selectedCols, setSelectedCols] = useState([])
   const [timeCol, setTimeCol]           = useState('Time')
   const [offsetS1, setOffsetS1]         = useState(0)
   const [offsetS2, setOffsetS2]         = useState(0)
+  const [offsetST, setOffsetST]         = useState(0)
   const [timeUnit, setTimeUnit]         = useState('ms')
 
   // Video state
@@ -187,6 +265,8 @@ export default function App() {
   const videoUrlRef     = useRef(null)
   const offsetS1Ref     = useRef(0)
   const offsetS2Ref     = useRef(0)
+  const offsetSTRef     = useRef(0)
+  const showSpeedTrackerRef = useRef(false)
   const timeUnitRef     = useRef('ms')
   const lastTRef        = useRef(null)
   const plotInitRef      = useRef(false)
@@ -208,10 +288,22 @@ export default function App() {
   const showGapsRef      = useRef(false)
   const s1TraceIdxRef    = useRef([])
   const s2TraceIdxRef    = useRef([])
+  const stTraceIdxRef    = useRef([])
   const selectedMarkupRef = useRef(null)
+
+  const insoleSensorNames = useMemo(
+    () => sensorNames.filter(n => n !== SPEED_TRACKER),
+    [sensorNames],
+  )
+  const hasSpeedTracker = useMemo(
+    () => sensorNames.includes(SPEED_TRACKER),
+    [sensorNames],
+  )
 
   useEffect(() => { offsetS1Ref.current    = offsetS1     }, [offsetS1])
   useEffect(() => { offsetS2Ref.current    = offsetS2     }, [offsetS2])
+  useEffect(() => { offsetSTRef.current    = offsetST     }, [offsetST])
+  useEffect(() => { showSpeedTrackerRef.current = showSpeedTracker }, [showSpeedTracker])
   useEffect(() => { timeUnitRef.current    = timeUnit     }, [timeUnit])
   useEffect(() => { labelingRef.current    = labelingMode }, [labelingMode])
   useEffect(() => { currentFootRef.current = currentFoot  }, [currentFoot])
@@ -312,6 +404,8 @@ export default function App() {
     setShowRightPatterns(true)
     setShowSensor1(true)
     setShowSensor2(true)
+    setShowSpeedTracker(false)
+    setOffsetST(0)
     setShowGaps(false)
     setCheckHzData(null)
     setSelectedMarkup(null)
@@ -333,38 +427,27 @@ export default function App() {
       if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`)
 
       const result = await resp.json()
-      const rows = JSON.parse(result.data)
+      const rows = parseSessionRows(result.data)
 
       if (!rows?.length) { setStatus({ text: 'Сессия пустая', type: 'error' }); return }
 
-      const colMap = {}
-      Object.keys(rows[0]).forEach(k => { colMap[k] = [] })
-      rows.forEach(row => Object.entries(row).forEach(([k, v]) => colMap[k].push(v)))
+      const colMap = rowsToColMap(rows)
       setParquetData(colMap)
 
       const allCols = Object.keys(colMap)
-      const tCol = allCols.find(c => c === 'Time')
-             || allCols.find(c => ['time', 'timestamp', 'Timestamp', 't'].includes(c))
-             || allCols[0]
+      const tCol = detectTimeCol(allCols)
       setTimeCol(tCol)
 
-      if (colMap['Name']) {
-        const names = [...new Set(colMap['Name'].filter(v => v != null && v !== ''))]
-          .sort((a, b) => a.localeCompare(b))
-        setSensorNames(names)
-      } else {
-        setSensorNames([])
-      }
+      const names = sortSensorNames(colMap)
+      const insole = names.filter(n => n !== SPEED_TRACKER)
+      const hasST = names.includes(SPEED_TRACKER)
+      setSensorNames(names)
 
-      const numCols = allCols.filter(c => {
-        if (NON_DATA_COLS.has(c) || c === tCol) return false
-        const s = colMap[c].find(v => v != null)
-        return s !== undefined && typeof s !== 'string'
-      })
+      const numCols = computeNumericColumns(colMap, tCol)
       setColumns(numCols)
-
-      const defaults = PREFERRED_COLS.filter(c => numCols.includes(c)).slice(0, 3)
-      setSelectedCols(defaults.length ? defaults : numCols.slice(0, 3))
+      setSelectedCols(buildDefaultCols(numCols, hasST))
+      setShowSpeedTracker(hasST)
+      setOffsetST(hasST ? computeAutoOffsetST(colMap, tCol, insole) : 0)
 
       const tVals   = (colMap[tCol] || []).map(safeNum).filter(v => v !== null)
       const tMax    = tVals.length ? Math.max(...tVals) : 0
@@ -372,7 +455,8 @@ export default function App() {
       setTimeUnit(autoUnit)
       timeUnitRef.current = autoUnit
 
-      setStatus({ text: `✓ ${rows.length} строк · ${numCols.length} колонок · ${autoUnit}`, type: 'ok' })
+      const stHint = hasST ? ' · SpeedTracker' : ''
+      setStatus({ text: `✓ ${rows.length} строк · ${numCols.length} колонок · ${autoUnit}${stHint}`, type: 'ok' })
 
       fetch(`${API_BASE}/api/check_hz/${sid}`, {
         headers: { 'accept': 'application/json', 'Authorization': `Bearer ${token}` },
@@ -442,7 +526,7 @@ export default function App() {
     if (showGapsRef.current && checkHzData) {
       const seen = new Set()
       const intervals = []
-      sensorNames.forEach((name, i) => {
+      insoleSensorNames.forEach((name, i) => {
         const visible = i === 0 ? showSensor1 : showSensor2
         if (!visible) return
         const gaps = checkHzData[name]?.gaps
@@ -465,7 +549,7 @@ export default function App() {
     Plotly.relayout(chartDivRef.current, {
       shapes: [...gapShapesRef.current, ...contactShapesRef.current, ...cursorShapesRef.current],
     })
-  }, [showGaps, checkHzData, sensorNames, showSensor1, showSensor2])
+  }, [showGaps, checkHzData, insoleSensorNames, showSensor1, showSensor2])
 
   useEffect(() => {
     leftContactsRef.current  = leftContacts
@@ -481,7 +565,7 @@ export default function App() {
 
   useEffect(() => {
     if (plotInitRef.current && chartDivRef.current) updateOverlayShapes()
-  }, [showGaps, checkHzData, showSensor1, showSensor2, offsetS1, offsetS2, selectedCols, selectedMarkup, updateOverlayShapes])
+  }, [showGaps, checkHzData, showSensor1, showSensor2, showSpeedTracker, offsetS1, offsetS2, offsetST, selectedCols, selectedMarkup, updateOverlayShapes])
 
   useEffect(() => {
     if (!chartReady || !chartDivRef.current) return
@@ -531,7 +615,7 @@ export default function App() {
     const timeArr = parquetData[timeCol] || []
     const nameArr = parquetData['Name']  || []
     const n = timeArr.length
-    const rightSensorName = sensorNames[1] || 'ESP32_Sensor_2'
+    const rightSensorName = insoleSensorNames[1] || 'ESP32_Sensor_2'
 
     const buildIv = (contacts) => {
       const out = []
@@ -551,9 +635,11 @@ export default function App() {
     for (let i = 0; i < n; i++) {
       const name = nameArr[i] || ''
       const t    = timeArr[i]
-      const target = name === rightSensorName
-        ? (inIv(t, rIv) ? 1 : 0)
-        : (inIv(t, lIv) ? 1 : 0)
+      const target = name === SPEED_TRACKER
+        ? ''
+        : name === rightSensorName
+          ? (inIv(t, rIv) ? 1 : 0)
+          : (inIv(t, lIv) ? 1 : 0)
       const vals = allCols.map(c => {
         const v = parquetData[c][i]
         return v == null ? '' : String(v)
@@ -570,7 +656,7 @@ export default function App() {
     a.download = (sessionLabel || 'session').replace(/\s+/g, '_') + '_labeled.csv'
     document.body.appendChild(a); a.click()
     document.body.removeChild(a); URL.revokeObjectURL(url)
-  }, [parquetData, timeCol, sessionLabel, sensorNames])
+  }, [parquetData, timeCol, sessionLabel, insoleSensorNames])
 
   // ── Video zoom helpers ────────────────────────────────────────────────────
   const clampPan = useCallback((z, px, py) => {
@@ -682,6 +768,8 @@ export default function App() {
     setShowRightPatterns(true)
     setShowSensor1(true)
     setShowSensor2(true)
+    setShowSpeedTracker(false)
+    setOffsetST(0)
     setShowGaps(false)
     setCheckHzData(null)
     setSelectedMarkup(null)
@@ -702,28 +790,19 @@ export default function App() {
       setParquetData(colMap)
 
       const allCols = Object.keys(colMap)
-      const tCol = allCols.find(c => c === 'Time')
-             || allCols.find(c => ['time', 'timestamp', 'Timestamp', 't'].includes(c))
-             || allCols[0]
+      const tCol = detectTimeCol(allCols)
       setTimeCol(tCol)
 
-      if (colMap['Name']) {
-        const names = [...new Set(colMap['Name'].filter(v => v != null && v !== ''))]
-          .sort((a, b) => a.localeCompare(b))
-        setSensorNames(names)
-      } else {
-        setSensorNames([])
-      }
+      const names = sortSensorNames(colMap)
+      const insole = names.filter(n => n !== SPEED_TRACKER)
+      const hasST = names.includes(SPEED_TRACKER)
+      setSensorNames(names)
 
-      const numCols = allCols.filter(c => {
-        if (NON_DATA_COLS.has(c) || c === tCol) return false
-        const s = colMap[c].find(v => v != null)
-        return s !== undefined && typeof s !== 'string'
-      })
+      const numCols = computeNumericColumns(colMap, tCol)
       setColumns(numCols)
-
-      const defaults = PREFERRED_COLS.filter(c => numCols.includes(c)).slice(0, 3)
-      setSelectedCols(defaults.length ? defaults : numCols.slice(0, 3))
+      setSelectedCols(buildDefaultCols(numCols, hasST))
+      setShowSpeedTracker(hasST)
+      setOffsetST(hasST ? computeAutoOffsetST(colMap, tCol, insole) : 0)
 
       const tVals   = (colMap[tCol] || []).map(safeNum).filter(v => v !== null)
       const tMax    = tVals.length ? Math.max(...tVals) : 0
@@ -731,7 +810,8 @@ export default function App() {
       setTimeUnit(autoUnit)
       timeUnitRef.current = autoUnit
 
-      setStatus({ text: `✓ ${rows.length} строк · ${numCols.length} колонок · ${autoUnit}`, type: 'ok' })
+      const stHint = hasST ? ' · SpeedTracker' : ''
+      setStatus({ text: `✓ ${rows.length} строк · ${numCols.length} колонок · ${autoUnit}${stHint}`, type: 'ok' })
     } catch (err) {
       setStatus({ text: `Ошибка чтения parquet: ${err.message}`, type: 'error' })
     }
@@ -748,8 +828,8 @@ export default function App() {
   const renderChart = useCallback(() => {
     if (!parquetData || !selectedCols.length || !chartDivRef.current) return
 
-    const sensor1Name = sensorNames[0] || ''
-    const sensor2Name = sensorNames.length > 1 ? sensorNames[1] : ''
+    const sensor1Name = insoleSensorNames[0] || ''
+    const sensor2Name = insoleSensorNames[1] || ''
     const nameArr = parquetData['Name']
 
     const filterBySensor = (sName) => {
@@ -770,13 +850,22 @@ export default function App() {
     }
     const data1 = applyUnwrap(filterBySensor(sensor1Name))
     const data2 = sensor2Name ? applyUnwrap(filterBySensor(sensor2Name)) : null
+    const dataST = hasSpeedTracker ? filterBySensor(SPEED_TRACKER) : null
 
     const shift1 = offsetS1Ref.current
     const shift2 = offsetS2Ref.current
+    const shiftST = offsetSTRef.current
     const tArr1 = (data1[timeCol] || []).map(v => { const n = safeNum(v); return n !== null ? n + shift1 : null })
     const tArr2 = data2 ? (data2[timeCol] || []).map(v => { const n = safeNum(v); return n !== null ? n + shift2 : null }) : []
+    const tArrST = dataST
+      ? (dataST[timeCol] || []).map(v => { const n = safeNum(v); return n !== null ? n + shiftST : null })
+      : []
 
-    const allTVals = [...tArr1, ...tArr2].filter(v => v !== null)
+    const allTVals = [
+      ...tArr1,
+      ...tArr2,
+      ...(showSpeedTrackerRef.current ? tArrST : []),
+    ].filter(v => v !== null)
     if (!allTVals.length) {
       setStatus({ text: `Колонка "${timeCol}" пустая`, type: 'error' })
       return
@@ -790,9 +879,14 @@ export default function App() {
 
     const yRanges = {}
     selectedCols.forEach(col => {
-      const vals1 = (data1[col] || []).map(safeNum).filter(v => v !== null)
-      const vals2 = data2 ? (data2[col] || []).map(safeNum).filter(v => v !== null) : []
-      const vals  = [...vals1, ...vals2]
+      const stOnly = ST_ONLY_COLS.has(col)
+      const vals1 = stOnly ? [] : (data1[col] || []).map(safeNum).filter(v => v !== null)
+      const vals2 = stOnly || !data2 ? [] : (data2[col] || []).map(safeNum).filter(v => v !== null)
+      let vals  = [...vals1, ...vals2]
+      if (dataST && showSpeedTrackerRef.current) {
+        const stCol = resolveStDataCol(dataST, col)
+        vals = [...vals, ...(dataST[stCol] || []).map(safeNum).filter(v => v !== null)]
+      }
       if (!vals.length) { yRanges[col] = [-1, 1]; return }
       const mn = Math.min(...vals), mx = Math.max(...vals)
       const p  = Math.max((mx - mn) * 0.08, 0.1)
@@ -803,34 +897,58 @@ export default function App() {
     const traces = []
     const s1Idx  = []
     const s2Idx  = []
+    const stIdx  = []
     selectedCols.forEach((col, i) => {
       const yAxis = i === 0 ? 'y' : `y${i + 1}`
       const xAxis = `x${i === 0 ? '' : i + 1}`
-      s1Idx.push(traces.length)
-      traces.push({
-        x: tArr1,
-        y: (data1[col] || []).map(safeNum),
-        name: data2 ? `${col} (S1)` : col,
-        type: 'scatter', mode: 'lines',
-        xaxis: xAxis, yaxis: yAxis,
-        line: { color: PALETTE[i % PALETTE.length], width: 1.5 },
-        connectgaps: false,
-      })
-      if (data2) {
-        s2Idx.push(traces.length)
+      const stOnly = ST_ONLY_COLS.has(col)
+
+      if (!stOnly) {
+        s1Idx.push(traces.length)
         traces.push({
-          x: tArr2,
-          y: (data2[col] || []).map(safeNum),
-          name: `${col} (S2)`,
+          x: tArr1,
+          y: (data1[col] || []).map(safeNum),
+          name: data2 ? `${col} (S1)` : col,
           type: 'scatter', mode: 'lines',
           xaxis: xAxis, yaxis: yAxis,
-          line: { color: S2_COLOR, width: 1.5 },
+          line: { color: PALETTE[i % PALETTE.length], width: 1.5 },
           connectgaps: false,
         })
+        if (data2) {
+          s2Idx.push(traces.length)
+          traces.push({
+            x: tArr2,
+            y: (data2[col] || []).map(safeNum),
+            name: `${col} (S2)`,
+            type: 'scatter', mode: 'lines',
+            xaxis: xAxis, yaxis: yAxis,
+            line: { color: S2_COLOR, width: 1.5 },
+            connectgaps: false,
+          })
+        }
+      }
+
+      if (dataST) {
+        const stCol = resolveStDataCol(dataST, col)
+        const yST = (dataST[stCol] || []).map(safeNum)
+        if (yST.some(v => v !== null)) {
+          stIdx.push(traces.length)
+          traces.push({
+            x: tArrST,
+            y: yST,
+            name: `${col} (ST)`,
+            type: 'scatter', mode: 'lines',
+            xaxis: xAxis, yaxis: yAxis,
+            line: { color: ST_COLOR, width: stOnly ? 2 : 1.5, dash: stOnly ? 'solid' : 'dot' },
+            connectgaps: false,
+            visible: showSpeedTrackerRef.current,
+          })
+        }
       }
     })
     s1TraceIdxRef.current = s1Idx
     s2TraceIdxRef.current = s2Idx
+    stTraceIdxRef.current = stIdx
 
     cursorShapesRef.current  = buildCursorShapes(xMin, n)
     contactShapesRef.current = []
@@ -896,7 +1014,7 @@ export default function App() {
         }
       })
     })
-  }, [parquetData, selectedCols, timeCol, sensorNames, offsetS1, offsetS2, updateOverlayShapes])
+  }, [parquetData, selectedCols, timeCol, insoleSensorNames, hasSpeedTracker, offsetS1, offsetS2, offsetST, showSpeedTracker, updateOverlayShapes])
 
   const handleUnwrapAngles = useCallback(() => {
     if (!parquetData || !selectedCols.length) return
@@ -904,6 +1022,11 @@ export default function App() {
     setAnglesUnwrapped(anglesUnwrappedRef.current)
     renderChart()
   }, [parquetData, selectedCols, renderChart])
+
+  useEffect(() => {
+    if (!plotInitRef.current || !parquetData || !selectedCols.length) return
+    renderChart()
+  }, [offsetS1, offsetS2, offsetST, showSpeedTracker, renderChart, parquetData, selectedCols.length])
 
   // ── Video timeupdate → move chart cursor ──────────────────────────────────
   const handleTimeUpdate = useCallback(() => {
@@ -1093,10 +1216,10 @@ export default function App() {
       {/* ── Controls ── */}
       {columns.length > 0 && (
         <div className="controls">
-          {sensorNames.length > 0 && (
+          {(insoleSensorNames.length > 0 || hasSpeedTracker) && (
             <div className="ctrl-row">
               <span className="ctrl-lbl">Сенсоры</span>
-              {sensorNames.map((name, i) => {
+              {insoleSensorNames.map((name, i) => {
                 const isS1      = i === 0
                 const isVisible = isS1 ? showSensor1 : showSensor2
                 const toggle    = () => isS1 ? setShowSensor1(v => !v) : setShowSensor2(v => !v)
@@ -1129,6 +1252,33 @@ export default function App() {
                   </span>
                 )
               })}
+              {hasSpeedTracker && (
+                <span className="sensor-group">
+                  <button
+                    className={`sensor-badge sensor-badge-st${showSpeedTracker ? '' : ' sensor-badge-off'}`}
+                    style={showSpeedTracker
+                      ? { borderColor: ST_COLOR, color: ST_COLOR, background: 'rgba(44,162,44,0.08)' }
+                      : {}}
+                    onClick={() => setShowSpeedTracker(v => !v)}
+                    title={showSpeedTracker ? 'Скрыть SpeedTracker' : 'Показать SpeedTracker (Distance, Speed)'}
+                  >
+                    {showSpeedTracker ? '●' : '○'}&nbsp;SpeedTracker
+                  </button>
+                  {checkHzData?.[SPEED_TRACKER] && (
+                    <span className="hz-stats" style={{ '--hzc': ST_COLOR }}>
+                      <span className="hz-stat-item" title="Среднее время между сэмплами">
+                        <span className="hz-stat-key">mean</span>
+                        <span className="hz-stat-val">{checkHzData[SPEED_TRACKER].time_diff_mean ?? '—'}</span>
+                      </span>
+                      <span className="hz-stat-sep" />
+                      <span className="hz-stat-item" title="Максимальное время между сэмплами">
+                        <span className="hz-stat-key">max</span>
+                        <span className="hz-stat-val">{checkHzData[SPEED_TRACKER].time_diff_max ?? '—'}</span>
+                      </span>
+                    </span>
+                  )}
+                </span>
+              )}
             </div>
           )}
 
@@ -1165,6 +1315,17 @@ export default function App() {
                 onChange={setOffsetS2}
               />
             </span>
+            {hasSpeedTracker && (
+              <span className="offset-pair">
+                <span className="offset-lbl offset-lbl-st">ST</span>
+                <OffsetInput
+                  value={offsetST}
+                  step={timeUnit === 'ms' ? 100 : 0.05}
+                  title="Сдвиг SpeedTracker (авто при загрузке)"
+                  onChange={setOffsetST}
+                />
+              </span>
+            )}
             <div className="unit-toggle">
               <button className={`unit-btn${timeUnit === 's'  ? ' active' : ''}`} onClick={() => setTimeUnit('s')}>с</button>
               <button className={`unit-btn${timeUnit === 'ms' ? ' active' : ''}`} onClick={() => setTimeUnit('ms')}>мс</button>
@@ -1234,7 +1395,7 @@ export default function App() {
           <div className="time-bar">
             <span ref={vidLblRef} className="time-lbl">0:00.0</span>
             <span ref={imuLblRef} className="time-lbl imu-lbl">IMU 0.00s</span>
-            <span className="time-lbl muted">S1:{offsetS1} S2:{offsetS2}{timeUnit === 'ms' ? 'мс' : 'с'}</span>
+            <span className="time-lbl muted">S1:{offsetS1} S2:{offsetS2}{hasSpeedTracker ? ` ST:${offsetST}` : ''}{timeUnit === 'ms' ? 'мс' : 'с'}</span>
             <span className="time-lbl muted dur">{formatTime(videoDuration)}</span>
           </div>
 
