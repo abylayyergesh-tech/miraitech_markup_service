@@ -113,6 +113,7 @@ body { background: var(--bg); overflow: hidden }
 }
 .offset-lbl-s1 { background: rgba(31,119,180,0.15); color: #1d4ed8 }
 .offset-lbl-s2 { background: rgba(255,127,14,0.15);  color: #c2410c }
+.offset-lbl-st { background: rgba(44,162,44,0.15);  color: #15803d }
 
 /* Offset input with custom spinners */
 .offset-input-wrap {
@@ -206,6 +207,10 @@ body { background: var(--bg); overflow: hidden }
   background: #f3f4f6 !important;
   opacity: 0.5;
 }
+.sensor-badge-st:not(.sensor-badge-off) {
+  border-color: #2ca02c;
+  color: #2ca02c;
+}
 
 /* Column chips */
 .col-chip {
@@ -264,6 +269,18 @@ body { background: var(--bg); overflow: hidden }
 }
 .btn-build:hover    { background: #1d4ed8 }
 .btn-build:disabled { opacity: .4; cursor: not-allowed }
+
+.btn-unwrap {
+  padding: 5px 14px;
+  background: #f3f4f6; color: #374151;
+  border: 1.5px solid #d1d5db; border-radius: 6px;
+  font-size: 13px; font-weight: 600; cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.btn-unwrap:hover    { background: #e5e7eb; border-color: #9ca3af }
+.btn-unwrap.active   { background: #ede9fe; color: #6d28d9; border-color: #a78bfa }
+.btn-unwrap.active:hover { background: #ddd6fe }
+.btn-unwrap:disabled { opacity: .4; cursor: not-allowed }
 
 /* ── Content area: side-by-side ─────────────────────────────────────── */
 .content {
