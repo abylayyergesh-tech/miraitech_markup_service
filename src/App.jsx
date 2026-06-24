@@ -205,6 +205,10 @@ export default function App() {
   // Session
   const [sessionId, setSessionId]       = useState('')
   const [sessionLabel, setSessionLabel] = useState('')
+  const [markupFiles, setMarkupFiles]   = useState([])
+  const [activeMarkupFileId, setActiveMarkupFileId] = useState('')
+  const [sessionAdditionalInfo, setSessionAdditionalInfo] = useState(null)
+  const [isSaving, setIsSaveLoading]    = useState(false)
 
   // Sessions list (for autocomplete)
   const [sessionsList, setSessionsList]               = useState([])
@@ -245,6 +249,11 @@ export default function App() {
   const [status, setStatus]         = useState({ text: '', type: 'idle' })
   const [chartReady, setChartReady] = useState(false)
   const [dragOver, setDragOver]     = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [dataPanelOpen, setDataPanelOpen]       = useState(true)
+  const [chartPanelOpen, setChartPanelOpen]     = useState(true)
+  const [labMenuOpen, setLabMenuOpen]           = useState(false)
+  const labMenuRef = useRef(null)
 
   // Labeling
   const [labelingMode, setLabelingMode]           = useState(false)
@@ -256,6 +265,7 @@ export default function App() {
   const [showGaps, setShowGaps]                   = useState(false)
   const [selectedMarkup, setSelectedMarkup]       = useState(null)
   const [anglesUnwrapped, setAnglesUnwrapped]     = useState(false)
+  const [relabelStep, setRelabelStep]             = useState(null)
 
   // Refs
   const videoRef        = useRef(null)
@@ -290,6 +300,8 @@ export default function App() {
   const s2TraceIdxRef    = useRef([])
   const stTraceIdxRef    = useRef([])
   const selectedMarkupRef = useRef(null)
+  const relabelStepRef   = useRef(null)
+  const zoomRangeRef     = useRef(null)
 
   const insoleSensorNames = useMemo(
     () => sensorNames.filter(n => n !== SPEED_TRACKER),
@@ -311,6 +323,7 @@ export default function App() {
   useEffect(() => { showGapsRef.current = showGaps }, [showGaps])
   useEffect(() => { anglesUnwrappedRef.current = anglesUnwrapped }, [anglesUnwrapped])
   useEffect(() => { selectedMarkupRef.current = selectedMarkup }, [selectedMarkup])
+  useEffect(() => { relabelStepRef.current = relabelStep }, [relabelStep])
 
   useEffect(() => {
     if (!selectedMarkup) return
@@ -389,6 +402,17 @@ export default function App() {
     return () => document.removeEventListener('mousedown', onDown)
   }, [])
 
+  useEffect(() => {
+    if (!labMenuOpen) return
+    const onDown = (e) => {
+      if (labMenuRef.current && !labMenuRef.current.contains(e.target)) {
+        setLabMenuOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [labMenuOpen])
+
   // ── Session loader ────────────────────────────────────────────────────────
   const loadSession = useCallback(async () => {
     const sid = sessionId.trim()
@@ -400,6 +424,11 @@ export default function App() {
     plotInitRef.current = false
     setLeftContacts([])
     setRightContacts([])
+    setMarkupFiles([])
+    setActiveMarkupFileId('')
+    setSessionAdditionalInfo(null)
+    zoomRangeRef.current = null
+    setRelabelStep(null)
     setShowLeftPatterns(true)
     setShowRightPatterns(true)
     setShowSensor1(true)
@@ -427,6 +456,23 @@ export default function App() {
       if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`)
 
       const result = await resp.json()
+      
+      setSessionAdditionalInfo(result.additional_info || null)
+      const initialMarkupFiles = result.additional_info?.markup_files || []
+      setMarkupFiles(initialMarkupFiles)
+      if (initialMarkupFiles.length > 0) {
+        const lastFile = initialMarkupFiles[initialMarkupFiles.length - 1]
+        setActiveMarkupFileId(lastFile.id)
+        setLeftContacts(lastFile.leftContacts || [])
+        setRightContacts(lastFile.rightContacts || [])
+        if (lastFile.meta) {
+          if (lastFile.meta.offsetS1 !== undefined) setOffsetS1(lastFile.meta.offsetS1)
+          if (lastFile.meta.offsetS2 !== undefined) setOffsetS2(lastFile.meta.offsetS2)
+          if (lastFile.meta.offsetST !== undefined) setOffsetST(lastFile.meta.offsetST)
+          if (lastFile.meta.timeUnit !== undefined) setTimeUnit(lastFile.meta.timeUnit)
+        }
+      }
+
       const rows = parseSessionRows(result.data)
 
       if (!rows?.length) { setStatus({ text: 'Сессия пустая', type: 'error' }); return }
@@ -609,8 +655,8 @@ export default function App() {
     setSelectedMarkup(null)
   }, [selectedMarkup])
 
-  const exportLabels = useCallback(() => {
-    if (!parquetData) return
+  const generateCsvString = useCallback(() => {
+    if (!parquetData) return ''
     const allCols = Object.keys(parquetData)
     const timeArr = parquetData[timeCol] || []
     const nameArr = parquetData['Name']  || []
@@ -648,7 +694,12 @@ export default function App() {
       rows.push(vals.join(','))
     }
 
-    const csv  = hdr + '\n' + rows.join('\n')
+    return hdr + '\n' + rows.join('\n')
+  }, [parquetData, timeCol, insoleSensorNames])
+
+  const exportLabels = useCallback(() => {
+    const csv = generateCsvString()
+    if (!csv) return
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
     const url  = URL.createObjectURL(blob)
     const a    = document.createElement('a')
@@ -656,7 +707,100 @@ export default function App() {
     a.download = (sessionLabel || 'session').replace(/\s+/g, '_') + '_labeled.csv'
     document.body.appendChild(a); a.click()
     document.body.removeChild(a); URL.revokeObjectURL(url)
-  }, [parquetData, timeCol, sessionLabel, insoleSensorNames])
+  }, [generateCsvString, sessionLabel])
+
+  const handleSelectMarkupFile = useCallback((id) => {
+    setRelabelStep(null)
+    if (id === 'new' || !id) {
+      setActiveMarkupFileId('new')
+      setLeftContacts([])
+      setRightContacts([])
+      return
+    }
+    const file = markupFiles.find(f => f.id === id)
+    if (file) {
+      setActiveMarkupFileId(file.id)
+      setLeftContacts(file.leftContacts || [])
+      setRightContacts(file.rightContacts || [])
+      if (file.meta) {
+        if (file.meta.offsetS1 !== undefined) setOffsetS1(file.meta.offsetS1)
+        if (file.meta.offsetS2 !== undefined) setOffsetS2(file.meta.offsetS2)
+        if (file.meta.offsetST !== undefined) setOffsetST(file.meta.offsetST)
+        if (file.meta.timeUnit !== undefined) setTimeUnit(file.meta.timeUnit)
+      }
+    }
+  }, [markupFiles])
+
+  const saveMarkupToDb = useCallback(async () => {
+    const sid = sessionId.trim()
+    if (!sid) return
+
+    setIsSaveLoading(true)
+    try {
+      const csv = generateCsvString()
+      const isNew = !activeMarkupFileId || activeMarkupFileId === 'new'
+      const fileId = isNew ? `mf_${Date.now()}` : activeMarkupFileId
+      const fileIndex = isNew ? -1 : markupFiles.findIndex(f => f.id === fileId)
+      
+      const newFile = {
+        id: fileId,
+        filename: !isNew && fileIndex >= 0
+          ? markupFiles[fileIndex].filename 
+          : `markup_${sid}_v${markupFiles.length + 1}.csv`,
+        type: 'contact_target_csv',
+        updated_at: new Date().toISOString(),
+        leftContacts: leftContactsRef.current,
+        rightContacts: rightContactsRef.current,
+        meta: {
+          offsetS1: offsetS1Ref.current,
+          offsetS2: offsetS2Ref.current,
+          offsetST: offsetSTRef.current,
+          timeUnit: timeUnitRef.current,
+        },
+        csv: csv,
+      }
+
+      let updatedFiles = [...markupFiles]
+      if (fileIndex >= 0) {
+        updatedFiles[fileIndex] = newFile
+      } else {
+        updatedFiles.push(newFile)
+      }
+
+      const updatedAdditionalInfo = {
+        ...(sessionAdditionalInfo || {}),
+        markup_files: updatedFiles
+      }
+
+      const resp = await fetch(`${API_BASE}/api/sessions/${sid}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          additional_info: updatedAdditionalInfo
+        })
+      })
+
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}: ${resp.statusText}`)
+      }
+
+      const updatedSession = await resp.json()
+      
+      setSessionAdditionalInfo(updatedSession.additional_info || null)
+      const nextFiles = updatedSession.additional_info?.markup_files || updatedFiles
+      setMarkupFiles(nextFiles)
+      setActiveMarkupFileId(fileId)
+      
+      setStatus({ text: '✓ Разметка успешно сохранена в БД', type: 'ok' })
+    } catch (err) {
+      setStatus({ text: `Ошибка сохранения: ${err.message}`, type: 'error' })
+    } finally {
+      setIsSaveLoading(false)
+    }
+  }, [sessionId, activeMarkupFileId, markupFiles, sessionAdditionalInfo, generateCsvString, token])
 
   // ── Video zoom helpers ────────────────────────────────────────────────────
   const clampPan = useCallback((z, px, py) => {
@@ -880,8 +1024,8 @@ export default function App() {
     const yRanges = {}
     selectedCols.forEach(col => {
       const stOnly = ST_ONLY_COLS.has(col)
-      const vals1 = stOnly ? [] : (data1[col] || []).map(safeNum).filter(v => v !== null)
-      const vals2 = stOnly || !data2 ? [] : (data2[col] || []).map(safeNum).filter(v => v !== null)
+      const vals1 = (stOnly || !showSensor1) ? [] : (data1[col] || []).map(safeNum).filter(v => v !== null)
+      const vals2 = (stOnly || !data2 || !showSensor2) ? [] : (data2[col] || []).map(safeNum).filter(v => v !== null)
       let vals  = [...vals1, ...vals2]
       if (dataST && showSpeedTrackerRef.current) {
         const stCol = resolveStDataCol(dataST, col)
@@ -893,7 +1037,6 @@ export default function App() {
       yRanges[col] = [mn - p, mx + p]
     })
 
-    const S2_COLOR = '#ff7f0e'
     const traces = []
     const s1Idx  = []
     const s2Idx  = []
@@ -911,8 +1054,9 @@ export default function App() {
           name: data2 ? `${col} (S1)` : col,
           type: 'scatter', mode: 'lines',
           xaxis: xAxis, yaxis: yAxis,
-          line: { color: PALETTE[i % PALETTE.length], width: 1.5 },
+          line: { color: PALETTE[(2 * i) % PALETTE.length], width: 1.5 },
           connectgaps: false,
+          visible: showSensor1,
         })
         if (data2) {
           s2Idx.push(traces.length)
@@ -922,8 +1066,9 @@ export default function App() {
             name: `${col} (S2)`,
             type: 'scatter', mode: 'lines',
             xaxis: xAxis, yaxis: yAxis,
-            line: { color: S2_COLOR, width: 1.5 },
+            line: { color: PALETTE[(2 * i + 1) % PALETTE.length], width: 1.5 },
             connectgaps: false,
+            visible: showSensor2,
           })
         }
       }
@@ -963,6 +1108,7 @@ export default function App() {
       plot_bgcolor: '#f8f9fa',
       paper_bgcolor: '#fff',
       showlegend: true,
+      dragmode: 'pan',
       legend: { orientation: 'h', y: -0.06, font: { size: 11 } },
     }
 
@@ -989,7 +1135,7 @@ export default function App() {
         tickfont:        { size: 10 },
         matches:         i > 0 ? 'x' : undefined,
         showticklabels:  i === n - 1,
-        range:           [xMin, xMax],
+        range:           zoomRangeRef.current || [xMin, xMax],
       }
     })
 
@@ -1005,7 +1151,30 @@ export default function App() {
       chartDivRef.current.on('plotly_click', (d) => {
         if (!d?.points?.length) return
         const t = d.points[0].x
-        if (labelingRef.current) {
+
+        if (relabelStepRef.current === 'start') {
+          const sm = selectedMarkupRef.current
+          if (sm) {
+            const setter = sm.foot === 'left' ? setLeftContacts : setRightContacts
+            setter(prev => {
+              const next = [...prev]
+              if (sm.index < next.length) next[sm.index] = t
+              return next
+            })
+            setRelabelStep('end')
+          }
+        } else if (relabelStepRef.current === 'end') {
+          const sm = selectedMarkupRef.current
+          if (sm) {
+            const setter = sm.foot === 'left' ? setLeftContacts : setRightContacts
+            setter(prev => {
+              const next = [...prev]
+              if (sm.index + 1 < next.length) next[sm.index + 1] = t
+              return next
+            })
+            setRelabelStep(null)
+          }
+        } else if (labelingRef.current) {
           if (currentFootRef.current === 'left') setLeftContacts(p => [...p, t])
           else setRightContacts(p => [...p, t])
         } else if (videoRef.current) {
@@ -1013,8 +1182,18 @@ export default function App() {
           videoRef.current.currentTime = Math.max(0, t / scale)
         }
       })
+
+      chartDivRef.current.on('plotly_relayout', (eventData) => {
+        if (eventData['xaxis.range[0]'] !== undefined && eventData['xaxis.range[1]'] !== undefined) {
+          zoomRangeRef.current = [eventData['xaxis.range[0]'], eventData['xaxis.range[1]']]
+        } else if (eventData['xaxis.range'] !== undefined) {
+          zoomRangeRef.current = eventData['xaxis.range']
+        } else if (eventData['xaxis.autorange'] === true) {
+          zoomRangeRef.current = null
+        }
+      })
     })
-  }, [parquetData, selectedCols, timeCol, insoleSensorNames, hasSpeedTracker, offsetS1, offsetS2, offsetST, showSpeedTracker, updateOverlayShapes])
+  }, [parquetData, selectedCols, timeCol, insoleSensorNames, hasSpeedTracker, offsetS1, offsetS2, offsetST, showSpeedTracker, updateOverlayShapes, showSensor1, showSensor2])
 
   const handleUnwrapAngles = useCallback(() => {
     if (!parquetData || !selectedCols.length) return
@@ -1026,7 +1205,7 @@ export default function App() {
   useEffect(() => {
     if (!plotInitRef.current || !parquetData || !selectedCols.length) return
     renderChart()
-  }, [offsetS1, offsetS2, offsetST, showSpeedTracker, renderChart, parquetData, selectedCols.length])
+  }, [offsetS1, offsetS2, offsetST, showSpeedTracker, showSensor1, showSensor2, renderChart, parquetData, selectedCols.length])
 
   // ── Video timeupdate → move chart cursor ──────────────────────────────────
   const handleTimeUpdate = useCallback(() => {
@@ -1158,193 +1337,247 @@ export default function App() {
         </div>
       </header>
 
-      {/* ── Toolbar ── */}
-      <div className="toolbar">
-        <UploadBtn accept="video/*,.mp4,.webm,.mov,.avi" onFile={loadVideo}>📹 Видео</UploadBtn>
-        <UploadBtn accept=".parquet" onFile={loadParquetFile}>📊 Parquet</UploadBtn>
-
-        <div className="session-group">
-          <span className="session-lbl">Сессия №</span>
-          <div className="session-combo">
-            <input
-              ref={sessionInputRef}
-              type="text"
-              inputMode="numeric"
-              className="input-sm session-input"
-              value={sessionId}
-              onChange={e => { setSessionId(e.target.value); setShowSessionDropdown(true) }}
-              onFocus={() => setShowSessionDropdown(true)}
-              onKeyDown={e => {
-                if (e.key === 'Enter') { setShowSessionDropdown(false); loadSession() }
-                if (e.key === 'Escape') setShowSessionDropdown(false)
-              }}
-              placeholder={sessionsListLoading ? 'Загрузка…' : '3421'}
-              autoComplete="off"
-            />
-            {showSessionDropdown && filteredSessions.length > 0 && (
-              <ul ref={dropdownRef} className="session-dropdown">
-                {filteredSessions.map(s => (
-                  <li
-                    key={s.id}
-                    className={`session-dropdown-item${String(s.id) === sessionId ? ' selected' : ''}`}
-                    onMouseDown={e => {
-                      e.preventDefault()
-                      setSessionId(String(s.id))
-                      setShowSessionDropdown(false)
-                    }}
-                  >
-                    <span className="sdi-id">#{s.id}</span>
-                    <span className="sdi-name">{s.member_name || '—'}</span>
-                    {s.date && <span className="sdi-date">{s.date.slice(0, 10)}</span>}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
+      <div className={`app-body${sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
+        <aside className="sidebar">
           <button
-            className="btn-build"
-            onClick={() => { setShowSessionDropdown(false); loadSession() }}
-            disabled={!sessionId.trim() || status.type === 'loading'}
+            type="button"
+            className="sidebar-collapse-btn"
+            onClick={() => setSidebarCollapsed(v => !v)}
+            title={sidebarCollapsed ? 'Развернуть панель' : 'Свернуть панель'}
           >
-            ⬇ Загрузить
+            {sidebarCollapsed ? '▶' : '◀'}
           </button>
-        </div>
 
-        {status.text && <span className={`status-pill status-${status.type}`}>{status.text}</span>}
-      </div>
+          {!sidebarCollapsed && (
+            <div className="sidebar-scroll">
+              <SidebarSection
+                title="1. Данные"
+                open={dataPanelOpen}
+                onToggle={() => setDataPanelOpen(v => !v)}
+              >
+                <div className="sidebar-actions">
+                  <div className="btn-group btn-group-block">
+                    <UploadBtn accept="video/*,.mp4,.webm,.mov,.avi" onFile={loadVideo}>
+                      📹 Видео
+                    </UploadBtn>
+                    <UploadBtn accept=".parquet" onFile={loadParquetFile}>
+                      📊 Parquet
+                    </UploadBtn>
+                  </div>
 
-      {/* ── Controls ── */}
-      {columns.length > 0 && (
-        <div className="controls">
-          {(insoleSensorNames.length > 0 || hasSpeedTracker) && (
-            <div className="ctrl-row">
-              <span className="ctrl-lbl">Сенсоры</span>
-              {insoleSensorNames.map((name, i) => {
-                const isS1      = i === 0
-                const isVisible = isS1 ? showSensor1 : showSensor2
-                const toggle    = () => isS1 ? setShowSensor1(v => !v) : setShowSensor2(v => !v)
-                const color     = isS1 ? PALETTE[0] : '#ff7f0e'
-                const bg        = isS1 ? 'rgba(31,119,180,0.08)' : 'rgba(255,127,14,0.08)'
-                const stats     = checkHzData?.[name]
-                return (
-                  <span key={name} className="sensor-group">
-                    <button
-                      className={`sensor-badge${isVisible ? '' : ' sensor-badge-off'}`}
-                      style={isVisible ? { borderColor: color, color, background: bg } : {}}
-                      onClick={toggle}
-                      title={isVisible ? `Скрыть ${name}` : `Показать ${name}`}
-                    >
-                      {isVisible ? '●' : '○'}&nbsp;{name.replace('ESP32_', '')}&nbsp;{i === 0 ? '(left)' : '(right)'}
-                    </button>
-                    {stats && (
-                      <span className="hz-stats" style={{ '--hzc': color }}>
-                        <span className="hz-stat-item" title="Среднее время между сэмплами">
-                          <span className="hz-stat-key">mean</span>
-                          <span className="hz-stat-val">{stats.time_diff_mean ?? '—'}</span>
-                        </span>
-                        <span className="hz-stat-sep" />
-                        <span className="hz-stat-item" title="Максимальное время между сэмплами">
-                          <span className="hz-stat-key">max</span>
-                          <span className="hz-stat-val">{stats.time_diff_max ?? '—'}</span>
-                        </span>
-                      </span>
-                    )}
-                  </span>
-                )
-              })}
-              {hasSpeedTracker && (
-                <span className="sensor-group">
-                  <button
-                    className={`sensor-badge sensor-badge-st${showSpeedTracker ? '' : ' sensor-badge-off'}`}
-                    style={showSpeedTracker
-                      ? { borderColor: ST_COLOR, color: ST_COLOR, background: 'rgba(44,162,44,0.08)' }
-                      : {}}
-                    onClick={() => setShowSpeedTracker(v => !v)}
-                    title={showSpeedTracker ? 'Скрыть SpeedTracker' : 'Показать SpeedTracker (Distance, Speed)'}
-                  >
-                    {showSpeedTracker ? '●' : '○'}&nbsp;SpeedTracker
-                  </button>
-                  {checkHzData?.[SPEED_TRACKER] && (
-                    <span className="hz-stats" style={{ '--hzc': ST_COLOR }}>
-                      <span className="hz-stat-item" title="Среднее время между сэмплами">
-                        <span className="hz-stat-key">mean</span>
-                        <span className="hz-stat-val">{checkHzData[SPEED_TRACKER].time_diff_mean ?? '—'}</span>
-                      </span>
-                      <span className="hz-stat-sep" />
-                      <span className="hz-stat-item" title="Максимальное время между сэмплами">
-                        <span className="hz-stat-key">max</span>
-                        <span className="hz-stat-val">{checkHzData[SPEED_TRACKER].time_diff_max ?? '—'}</span>
-                      </span>
-                    </span>
+                  <div className="sidebar-field">
+                    <span className="sidebar-field-lbl">Сессия</span>
+                    <div className="session-group session-group-stack">
+                      <div className="session-combo">
+                        <input
+                          ref={sessionInputRef}
+                          type="text"
+                          inputMode="numeric"
+                          className="input-sm session-input session-input-wide"
+                          value={sessionId}
+                          onChange={e => { setSessionId(e.target.value); setShowSessionDropdown(true) }}
+                          onFocus={() => setShowSessionDropdown(true)}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter') { setShowSessionDropdown(false); loadSession() }
+                            if (e.key === 'Escape') setShowSessionDropdown(false)
+                          }}
+                          placeholder={sessionsListLoading ? 'Загрузка…' : '3421'}
+                          autoComplete="off"
+                        />
+                        {showSessionDropdown && filteredSessions.length > 0 && (
+                          <ul ref={dropdownRef} className="session-dropdown">
+                            {filteredSessions.map(s => (
+                              <li
+                                key={s.id}
+                                className={`session-dropdown-item${String(s.id) === sessionId ? ' selected' : ''}`}
+                                onMouseDown={e => {
+                                  e.preventDefault()
+                                  setSessionId(String(s.id))
+                                  setShowSessionDropdown(false)
+                                }}
+                              >
+                                <span className="sdi-id">#{s.id}</span>
+                                <span className="sdi-name">{s.member_name || '—'}</span>
+                                {s.date && <span className="sdi-date">{s.date.slice(0, 10)}</span>}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        className="btn-primary btn-block"
+                        onClick={() => { setShowSessionDropdown(false); loadSession() }}
+                        disabled={!sessionId.trim() || status.type === 'loading'}
+                      >
+                        ⬇ Загрузить сессию
+                      </button>
+                    </div>
+                  </div>
+
+                  {status.text && (
+                    <span className={`status-pill status-${status.type} status-block`}>{status.text}</span>
                   )}
-                </span>
+                </div>
+              </SidebarSection>
+
+              {columns.length > 0 && (
+                <SidebarSection
+                  title="2. График"
+                  open={chartPanelOpen}
+                  onToggle={() => setChartPanelOpen(v => !v)}
+                >
+                  <div className="sidebar-actions">
+                    {(insoleSensorNames.length > 0 || hasSpeedTracker) && (
+                      <div className="sidebar-block">
+                        <span className="sidebar-block-lbl">Сенсоры</span>
+                        <div className="sidebar-chip-list">
+                          {insoleSensorNames.map((name, i) => {
+                            const isS1      = i === 0
+                            const isVisible = isS1 ? showSensor1 : showSensor2
+                            const toggle    = () => isS1 ? setShowSensor1(v => !v) : setShowSensor2(v => !v)
+                            const color     = isS1 ? PALETTE[0] : '#ff7f0e'
+                            const bg        = isS1 ? 'rgba(31,119,180,0.08)' : 'rgba(255,127,14,0.08)'
+                            const stats     = checkHzData?.[name]
+                            return (
+                              <div key={name} className="sensor-group sensor-group-stack">
+                                <button
+                                  type="button"
+                                  className={`btn-toggle sensor-badge${isVisible ? '' : ' sensor-badge-off'}`}
+                                  style={isVisible ? { borderColor: color, color, background: bg } : {}}
+                                  onClick={toggle}
+                                  title={isVisible ? `Скрыть ${name}` : `Показать ${name}`}
+                                >
+                                  {isVisible ? '●' : '○'}&nbsp;{name.replace('ESP32_', '')}&nbsp;{i === 0 ? '(L)' : '(R)'}
+                                </button>
+                                {stats && (
+                                  <span className="hz-stats hz-stats-compact" style={{ '--hzc': color }}>
+                                    <span className="hz-stat-item" title="mean">
+                                      <span className="hz-stat-key">μ</span>
+                                      <span className="hz-stat-val">{stats.time_diff_mean ?? '—'}</span>
+                                    </span>
+                                    <span className="hz-stat-sep" />
+                                    <span className="hz-stat-item" title="max">
+                                      <span className="hz-stat-key">max</span>
+                                      <span className="hz-stat-val">{stats.time_diff_max ?? '—'}</span>
+                                    </span>
+                                  </span>
+                                )}
+                              </div>
+                            )
+                          })}
+                          {hasSpeedTracker && (
+                            <div className="sensor-group sensor-group-stack">
+                              <button
+                                type="button"
+                                className={`btn-toggle sensor-badge sensor-badge-st${showSpeedTracker ? '' : ' sensor-badge-off'}`}
+                                style={showSpeedTracker
+                                  ? { borderColor: ST_COLOR, color: ST_COLOR, background: 'rgba(44,162,44,0.08)' }
+                                  : {}}
+                                onClick={() => setShowSpeedTracker(v => !v)}
+                              >
+                                {showSpeedTracker ? '●' : '○'}&nbsp;SpeedTracker
+                              </button>
+                              {checkHzData?.[SPEED_TRACKER] && (
+                                <span className="hz-stats hz-stats-compact" style={{ '--hzc': ST_COLOR }}>
+                                  <span className="hz-stat-item">
+                                    <span className="hz-stat-key">μ</span>
+                                    <span className="hz-stat-val">{checkHzData[SPEED_TRACKER].time_diff_mean ?? '—'}</span>
+                                  </span>
+                                </span>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="sidebar-block">
+                      <span className="sidebar-block-lbl">Колонки</span>
+                      <div className="sidebar-chip-list">
+                        {columns.map(col => (
+                          <button
+                            type="button"
+                            key={col}
+                            className={`btn-toggle col-chip${selectedCols.includes(col) ? ' active' : ''}`}
+                            style={selectedCols.includes(col)
+                              ? { '--c': PALETTE[selectedCols.indexOf(col) % PALETTE.length] } : {}}
+                            onClick={() => toggleCol(col)}
+                          >{col}</button>
+                        ))}
+                      </div>
+                      <div className="btn-group btn-group-sm">
+                        <button type="button" className="btn-toggle col-chip ghost" onClick={() => setSelectedCols([...columns])}>все</button>
+                        <button type="button" className="btn-toggle col-chip ghost" onClick={() => setSelectedCols([])}>сброс</button>
+                      </div>
+                    </div>
+
+                    <div className="sidebar-block">
+                      <span className="sidebar-block-lbl">Сдвиги</span>
+                      <div className="offset-grid">
+                        <span className="offset-pair">
+                          <span className="offset-lbl offset-lbl-s1">S1</span>
+                          <OffsetInput
+                            value={offsetS1}
+                            step={timeUnit === 'ms' ? 100 : 0.05}
+                            title="Сдвиг Sensor 1 (левая нога)"
+                            onChange={setOffsetS1}
+                          />
+                        </span>
+                        <span className="offset-pair">
+                          <span className="offset-lbl offset-lbl-s2">S2</span>
+                          <OffsetInput
+                            value={offsetS2}
+                            step={timeUnit === 'ms' ? 100 : 0.05}
+                            title="Сдвиг Sensor 2 (правая нога)"
+                            onChange={setOffsetS2}
+                          />
+                        </span>
+                        {hasSpeedTracker && (
+                          <span className="offset-pair">
+                            <span className="offset-lbl offset-lbl-st">ST</span>
+                            <OffsetInput
+                              value={offsetST}
+                              step={timeUnit === 'ms' ? 100 : 0.05}
+                              title="Сдвиг SpeedTracker"
+                              onChange={setOffsetST}
+                            />
+                          </span>
+                        )}
+                      </div>
+                      <div className="sidebar-row">
+                        <div className="btn-group">
+                          <button type="button" className={`btn-toggle unit-btn${timeUnit === 's'  ? ' active' : ''}`} onClick={() => setTimeUnit('s')}>с</button>
+                          <button type="button" className={`btn-toggle unit-btn${timeUnit === 'ms' ? ' active' : ''}`} onClick={() => setTimeUnit('ms')}>мс</button>
+                        </div>
+                        <button
+                          type="button"
+                          className={`btn-secondary btn-unwrap${anglesUnwrapped ? ' active' : ''}`}
+                          disabled={!selectedCols.length}
+                          onClick={handleUnwrapAngles}
+                          title={anglesUnwrapped ? 'Вернуть исходные углы' : 'Развернуть углы'}
+                        >
+                          ↺ Углы
+                        </button>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      className="btn-primary btn-block"
+                      disabled={!selectedCols.length}
+                      onClick={renderChart}
+                    >
+                      ▶ Построить график
+                    </button>
+                  </div>
+                </SidebarSection>
               )}
             </div>
           )}
+        </aside>
 
-          <div className="ctrl-row">
-            <span className="ctrl-lbl">Колонки</span>
-            {columns.map(col => (
-              <button
-                key={col}
-                className={`col-chip${selectedCols.includes(col) ? ' active' : ''}`}
-                style={selectedCols.includes(col)
-                  ? { '--c': PALETTE[selectedCols.indexOf(col) % PALETTE.length] } : {}}
-                onClick={() => toggleCol(col)}
-              >{col}</button>
-            ))}
-            <button className="col-chip ghost" onClick={() => setSelectedCols([...columns])}>все</button>
-            <button className="col-chip ghost" onClick={() => setSelectedCols([])}>сброс</button>
-            <span className="ctrl-sep" />
-            <span className="ctrl-lbl" style={{ minWidth: 'unset' }}>↔</span>
-            <span className="offset-pair">
-              <span className="offset-lbl offset-lbl-s1">S1</span>
-              <OffsetInput
-                value={offsetS1}
-                step={timeUnit === 'ms' ? 100 : 0.05}
-                title="Сдвиг Sensor 1 (левая нога)"
-                onChange={setOffsetS1}
-              />
-            </span>
-            <span className="offset-pair">
-              <span className="offset-lbl offset-lbl-s2">S2</span>
-              <OffsetInput
-                value={offsetS2}
-                step={timeUnit === 'ms' ? 100 : 0.05}
-                title="Сдвиг Sensor 2 (правая нога)"
-                onChange={setOffsetS2}
-              />
-            </span>
-            {hasSpeedTracker && (
-              <span className="offset-pair">
-                <span className="offset-lbl offset-lbl-st">ST</span>
-                <OffsetInput
-                  value={offsetST}
-                  step={timeUnit === 'ms' ? 100 : 0.05}
-                  title="Сдвиг SpeedTracker (авто при загрузке)"
-                  onChange={setOffsetST}
-                />
-              </span>
-            )}
-            <div className="unit-toggle">
-              <button className={`unit-btn${timeUnit === 's'  ? ' active' : ''}`} onClick={() => setTimeUnit('s')}>с</button>
-              <button className={`unit-btn${timeUnit === 'ms' ? ' active' : ''}`} onClick={() => setTimeUnit('ms')}>мс</button>
-            </div>
-            <button
-              className={`btn-unwrap${anglesUnwrapped ? ' active' : ''}`}
-              disabled={!selectedCols.length}
-              onClick={handleUnwrapAngles}
-              title={anglesUnwrapped ? 'Вернуть исходные углы' : 'Развернуть углы (убрать скачки ±360°)'}
-            >
-              ↺ {anglesUnwrapped ? 'Углы развёрнуты' : 'Развернуть углы'}
-            </button>
-            <button className="btn-build" disabled={!selectedCols.length} onClick={renderChart}>
-              ▶ Построить
-            </button>
-          </div>
-        </div>
-      )}
-
+        <div className="main-area">
       {/* ── Content ── */}
       <div className="content">
 
@@ -1376,7 +1609,7 @@ export default function App() {
             ) : (
               <div className="drop-hint">
                 <span>📹</span>
-                <p>Перетащите видео или используйте кнопку выше</p>
+                <p>Перетащите видео или загрузите в панели слева</p>
               </div>
             )}
 
@@ -1423,153 +1656,287 @@ export default function App() {
         {/* Right: labeling + chart */}
         <div className="chart-side">
           <div className="label-panel">
-            <button
-              className={`lab-mode-btn${labelingMode ? ' active' : ''}`}
-              onClick={() => setLabelingMode(m => !m)}
-              title={labelingMode ? 'Выключить режим разметки' : 'Включить режим разметки'}
-            >
-              ✏ {labelingMode ? 'Разметка вкл' : 'Разметка'}
-            </button>
-
-            <button
-              className={`gap-vis-btn${showGaps ? ' vis-on' : ''}`}
-              onClick={() => setShowGaps(v => !v)}
-              disabled={!checkHzData || totalGaps === 0 || !chartReady}
-              title={
-                !checkHzData
-                  ? 'Загрузите сессию для анализа пропусков'
-                  : totalGaps === 0
-                    ? 'Пропусков в данных не обнаружено'
-                    : showGaps
-                      ? 'Скрыть пропуски на графике'
-                      : `Показать ${totalGaps} пропуск(ов) красными отрезками`
-              }
-            >
-              {showGaps ? '●' : '○'}&nbsp;Пропуски{totalGaps > 0 ? ` (${totalGaps})` : ''}
-            </button>
-
-            {totalContacts > 0 && (
-              <div className="pattern-toggle">
+            <div className="label-toolbar-row">
+              <div className="label-toolbar-group">
                 <button
-                  className={`pattern-vis-btn${showLeftPatterns ? ' vis-on' : ''}`}
-                  style={{ '--pc': L_LINE }}
-                  onClick={() => setShowLeftPatterns(v => !v)}
-                  title={showLeftPatterns ? 'Скрыть паттерны Sensor 1' : 'Показать паттерны Sensor 1'}
+                  type="button"
+                  className={`btn-toggle lab-mode-btn${labelingMode ? ' active' : ''}`}
+                  onClick={() => setLabelingMode(m => !m)}
+                  title={labelingMode ? 'Выключить режим разметки' : 'Включить режим разметки'}
                 >
-                  {showLeftPatterns ? '●' : '○'}&nbsp;S1
+                  ✏ {labelingMode ? 'Разметка вкл' : 'Разметка'}
                 </button>
+
                 <button
-                  className={`pattern-vis-btn${showRightPatterns ? ' vis-on' : ''}`}
-                  style={{ '--pc': R_LINE }}
-                  onClick={() => setShowRightPatterns(v => !v)}
-                  title={showRightPatterns ? 'Скрыть паттерны Sensor 2' : 'Показать паттерны Sensor 2'}
+                  type="button"
+                  className={`btn-toggle gap-vis-btn${showGaps ? ' vis-on' : ''}`}
+                  onClick={() => setShowGaps(v => !v)}
+                  disabled={!checkHzData || totalGaps === 0 || !chartReady}
+                  title={
+                    !checkHzData
+                      ? 'Загрузите сессию для анализа пропусков'
+                      : totalGaps === 0
+                        ? 'Пропусков в данных не обнаружено'
+                        : showGaps
+                          ? 'Скрыть пропуски на графике'
+                          : `Показать ${totalGaps} пропуск(ов) красными отрезками`
+                  }
                 >
-                  {showRightPatterns ? '●' : '○'}&nbsp;S2
+                  {showGaps ? '●' : '○'}&nbsp;Пропуски{totalGaps > 0 ? ` (${totalGaps})` : ''}
                 </button>
+
+                {totalContacts > 0 && (
+                  <div className="btn-group">
+                    <button
+                      type="button"
+                      className={`btn-toggle pattern-vis-btn${showLeftPatterns ? ' vis-on' : ''}`}
+                      style={{ '--pc': L_LINE }}
+                      onClick={() => setShowLeftPatterns(v => !v)}
+                      title={showLeftPatterns ? 'Скрыть паттерны Sensor 1' : 'Показать паттерны Sensor 1'}
+                    >
+                      S1
+                    </button>
+                    <button
+                      type="button"
+                      className={`btn-toggle pattern-vis-btn${showRightPatterns ? ' vis-on' : ''}`}
+                      style={{ '--pc': R_LINE }}
+                      onClick={() => setShowRightPatterns(v => !v)}
+                      title={showRightPatterns ? 'Скрыть паттерны Sensor 2' : 'Показать паттерны Sensor 2'}
+                    >
+                      S2
+                    </button>
+                  </div>
+                )}
               </div>
-            )}
 
-            {labelingMode && (
-              <>
-                <div className="foot-toggle">
-                  <button
-                    className={`foot-btn${currentFoot === 'left' ? ' active left-active' : ''}`}
-                    onClick={() => setCurrentFoot('left')}
+              <div className="label-toolbar-group label-toolbar-actions">
+                {markupFiles.length > 0 && (
+                  <select
+                    className="select-sm markup-file-select"
+                    value={activeMarkupFileId}
+                    onChange={e => handleSelectMarkupFile(e.target.value)}
+                    title="Выберите версию разметки"
                   >
-                    ◀ Sensor 1&nbsp;<span className="foot-count">{leftContacts.length}</span>
-                  </button>
-                  <button
-                    className={`foot-btn${currentFoot === 'right' ? ' active right-active' : ''}`}
-                    onClick={() => setCurrentFoot('right')}
-                  >
-                    Sensor 2&nbsp;<span className="foot-count">{rightContacts.length}</span>&nbsp;▶
-                  </button>
-                </div>
-
-                <button className="lab-btn" onClick={undoContact} title="Отменить последний клик">↩ Отмена</button>
-                <button className="lab-btn danger" onClick={clearCurrentContacts} title="Очистить текущую ногу">Очист.</button>
-                <button className="lab-btn danger" onClick={clearAllContacts} title="Очистить всё">Все</button>
+                    {markupFiles.map(f => (
+                      <option key={f.id} value={f.id}>
+                        {f.filename} ({new Date(f.updated_at).toLocaleTimeString()})
+                      </option>
+                    ))}
+                    <option value="new">+ Новая разметка</option>
+                  </select>
+                )}
+                {labelingMode && (
+                  <span className="lab-stat lab-stat-inline">
+                    <span className="lab-stat-l">S1: {Math.floor(leftContacts.length / 2)}</span>
+                    <span className="lab-stat-sep">·</span>
+                    <span className="lab-stat-r">S2: {Math.floor(rightContacts.length / 2)}</span>
+                  </span>
+                )}
                 <button
-                  className="lab-btn export"
+                  type="button"
+                  className="btn-primary lab-btn save-db"
+                  onClick={saveMarkupToDb}
+                  disabled={isSaving || !sessionId.trim()}
+                  title="Сохранить текущую разметку в БД"
+                >
+                  {isSaving ? 'Сохранение…' : '💾 Сохранить в БД'}
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary lab-btn export"
                   onClick={exportLabels}
                   disabled={totalContacts === 0}
                   title="Скачать CSV с разметкой Target"
-                >⬇ CSV</button>
+                >
+                  ⬇ CSV
+                </button>
+              </div>
+            </div>
 
-                <span className="lab-stat">
-                  <span className="lab-stat-l">S1: {Math.floor(leftContacts.length / 2)}</span>
-                  {' | '}
-                  <span className="lab-stat-r">S2: {Math.floor(rightContacts.length / 2)}</span>
-                  {' интерв.'}
-                </span>
-
-                {(leftContacts.length > 0 || rightContacts.length > 0) && (
-                  <div className="zone-dur-block">
-                    {[
-                      { contacts: leftContacts, cls: 'zone-dur-s1', label: 'S1', foot: 'left' },
-                      { contacts: rightContacts, cls: 'zone-dur-s2', label: 'S2', foot: 'right' },
-                    ].map(({ contacts, cls, label, foot }) => contacts.length > 0 && (
-                      <div key={label} className="zone-dur-row">
-                        <span className={`zone-dur-label ${cls}`}>{label}</span>
-                        {Array.from({ length: Math.floor(contacts.length / 2) }, (_, i) => {
-                          const t0 = contacts[i * 2]
-                          const t1 = contacts[i * 2 + 1]
-                          const dur = Math.abs(t1 - t0)
-                          const sel = selectedMarkup?.foot === foot && selectedMarkup.index === i * 2
-                          return (
-                            <span
-                              key={i}
-                              className={`zone-dur-chip ${cls}${sel ? ' zone-dur-selected' : ''}`}
-                              title={`${t0.toFixed(2)} → ${t1.toFixed(2)}`}
-                              onClick={() => setSelectedMarkup({ foot, index: i * 2 })}
-                            >
-                              #{i + 1}&thinsp;{formatDuration(dur, timeUnit)}
-                            </span>
-                          )
-                        })}
-                        {contacts.length % 2 === 1 && (
-                          <span
-                            className={`zone-dur-chip zone-dur-pending${
-                              selectedMarkup?.foot === foot && selectedMarkup.index === contacts.length - 1
-                                ? ' zone-dur-selected' : ''
-                            }`}
-                            onClick={() => setSelectedMarkup({ foot, index: contacts.length - 1 })}
-                          >
-                            …2-я точка
-                          </span>
-                        )}
-                      </div>
-                    ))}
-                    <div className="zone-dur-actions">
-                      <button
-                        className="lab-btn danger"
-                        onClick={deleteSelectedMarkup}
-                        disabled={!selectedMarkup}
-                        title="Удалить выбранный интервал из списка"
-                      >
-                        ✕ Удалить выбранную
-                      </button>
-                      {selectedMarkup && (() => {
-                        const contacts = selectedMarkup.foot === 'left' ? leftContacts : rightContacts
-                        const pairStart = getPairStartIndex(selectedMarkup.index)
-                        const t0 = contacts[pairStart]
-                        if (t0 == null) return null
-                        const footLabel = selectedMarkup.foot === 'left' ? 'S1' : 'S2'
-                        const intervalNum = Math.floor(pairStart / 2) + 1
-                        const t1 = contacts[pairStart + 1]
-                        const hasPair = pairStart + 1 < contacts.length
-                        const fmt = (t) => timeUnit === 'ms' ? `${t.toFixed(0)} мс` : `${t.toFixed(3)} с`
-                        return (
-                          <span className="lab-stat lab-stat-selected">
-                            {footLabel} #{intervalNum}
-                            {hasPair ? `: ${fmt(t0)} → ${fmt(t1)}` : `: ${fmt(t0)} (1 точка)`}
-                          </span>
-                        )
-                      })()}
-                    </div>
+            {labelingMode && (
+              <div className="label-toolbar-row label-toolbar-row-secondary">
+                <div className="label-toolbar-group">
+                  <div className="btn-group foot-toggle">
+                    <button
+                      type="button"
+                      className={`foot-btn${currentFoot === 'left' ? ' active left-active' : ''}`}
+                      onClick={() => setCurrentFoot('left')}
+                    >
+                      ◀ S1&nbsp;<span className="foot-count">{leftContacts.length}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`foot-btn${currentFoot === 'right' ? ' active right-active' : ''}`}
+                      onClick={() => setCurrentFoot('right')}
+                    >
+                      S2&nbsp;<span className="foot-count">{rightContacts.length}</span>&nbsp;▶
+                    </button>
                   </div>
-                )}
-              </>
+
+                  <button type="button" className="btn-secondary lab-btn" onClick={undoContact} title="Отменить последний клик">
+                    ↩ Отмена
+                  </button>
+
+                  <div className="lab-menu-wrap" ref={labMenuRef}>
+                    <button
+                      type="button"
+                      className="btn-secondary lab-btn lab-menu-trigger"
+                      onClick={() => setLabMenuOpen(v => !v)}
+                      title="Дополнительные действия"
+                    >
+                      ⋯
+                    </button>
+                    {labMenuOpen && (
+                      <div className="lab-menu">
+                        <button
+                          type="button"
+                          className="lab-menu-item"
+                          onClick={() => { clearCurrentContacts(); setLabMenuOpen(false) }}
+                        >
+                          Очистить текущую ногу
+                        </button>
+                        <button
+                          type="button"
+                          className="lab-menu-item danger"
+                          onClick={() => { clearAllContacts(); setLabMenuOpen(false) }}
+                        >
+                          Очистить всё
+                        </button>
+                        <button
+                          type="button"
+                          className="lab-menu-item danger"
+                          disabled={!selectedMarkup}
+                          onClick={() => { deleteSelectedMarkup(); setLabMenuOpen(false) }}
+                        >
+                          Удалить выбранный интервал
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {selectedMarkup && (() => {
+                  const contacts = selectedMarkup.foot === 'left' ? leftContacts : rightContacts
+                  const pairStart = getPairStartIndex(selectedMarkup.index)
+                  const t0 = contacts[pairStart]
+                  if (t0 == null) return null
+                  const footLabel = selectedMarkup.foot === 'left' ? 'S1' : 'S2'
+                  const intervalNum = Math.floor(pairStart / 2) + 1
+                  const t1 = contacts[pairStart + 1]
+                  const hasPair = pairStart + 1 < contacts.length
+                  const fmt = (t) => timeUnit === 'ms' ? `${t.toFixed(0)} мс` : `${t.toFixed(3)} с`
+                  const chartCursorTime = currentTime * (timeUnit === 'ms' ? 1000 : 1)
+
+                  const setStartToCursor = () => {
+                    const setter = selectedMarkup.foot === 'left' ? setLeftContacts : setRightContacts
+                    setter(prev => {
+                      const next = [...prev]
+                      if (pairStart < next.length) next[pairStart] = chartCursorTime
+                      return next
+                    })
+                  }
+                  const setEndToCursor = () => {
+                    const setter = selectedMarkup.foot === 'left' ? setLeftContacts : setRightContacts
+                    setter(prev => {
+                      const next = [...prev]
+                      if (pairStart + 1 < next.length) next[pairStart + 1] = chartCursorTime
+                      return next
+                    })
+                  }
+
+                  return (
+                    <div className="selected-edit-controls">
+                      <span className="lab-stat lab-stat-selected">
+                        {footLabel} #{intervalNum}
+                        {hasPair ? `: ${fmt(t0)} → ${fmt(t1)}` : `: ${fmt(t0)} (1 точка)`}
+                      </span>
+                      <div className="btn-group edit-btns">
+                        <button
+                          type="button"
+                          className="btn-secondary btn-xs-edit"
+                          onClick={setStartToCursor}
+                          title={`Установить начало интервала на текущее время курсора (${fmt(chartCursorTime)})`}
+                        >
+                          ⏱ Старт в маркер
+                        </button>
+                        {hasPair && (
+                          <button
+                            type="button"
+                            className="btn-secondary btn-xs-edit"
+                            onClick={setEndToCursor}
+                            title={`Установить конец интервала на текущее время курсора (${fmt(chartCursorTime)})`}
+                          >
+                            ⏱ Конец в маркер
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className={`btn-secondary btn-xs-edit${relabelStep ? ' active-relabel' : ''}`}
+                          onClick={() => setRelabelStep(relabelStep ? null : 'start')}
+                          title="Изменить границы интервала двумя последовательными кликами на графике"
+                        >
+                          {relabelStep 
+                            ? (relabelStep === 'start' ? '📍 Кликните начало...' : '📍 Кликните конец...') 
+                            : '🖱 Переразметить кликами'
+                          }
+                        </button>
+                      </div>
+                    </div>
+                  )
+                })()}
+              </div>
+            )}
+
+            {labelingMode && (leftContacts.length > 0 || rightContacts.length > 0) && (
+              <div className="zone-dur-block">
+                {[
+                  { contacts: leftContacts, cls: 'zone-dur-s1', label: 'S1', foot: 'left' },
+                  { contacts: rightContacts, cls: 'zone-dur-s2', label: 'S2', foot: 'right' },
+                ].map(({ contacts, cls, label, foot }) => contacts.length > 0 && (
+                  <div key={label} className="zone-dur-row">
+                    <span className={`zone-dur-label ${cls}`}>{label}</span>
+                    {Array.from({ length: Math.floor(contacts.length / 2) }, (_, i) => {
+                      const t0 = contacts[i * 2]
+                      const t1 = contacts[i * 2 + 1]
+                      const dur = Math.abs(t1 - t0)
+                      const sel = selectedMarkup?.foot === foot && selectedMarkup.index === i * 2
+                      return (
+                        <span
+                          key={i}
+                          className={`zone-dur-chip ${cls}${sel ? ' zone-dur-selected' : ''}`}
+                          title={`${t0.toFixed(2)} → ${t1.toFixed(2)}`}
+                          onClick={() => {
+                            if (selectedMarkup?.foot === foot && selectedMarkup.index === i * 2) {
+                              setSelectedMarkup(null)
+                            } else {
+                              setSelectedMarkup({ foot, index: i * 2 })
+                            }
+                          }}
+                        >
+                          #{i + 1}&thinsp;{formatDuration(dur, timeUnit)}
+                        </span>
+                      )
+                    })}
+                    {contacts.length % 2 === 1 && (
+                      <span
+                        className={`zone-dur-chip zone-dur-pending${
+                          selectedMarkup?.foot === foot && selectedMarkup.index === contacts.length - 1
+                            ? ' zone-dur-selected' : ''
+                        }`}
+                        onClick={() => {
+                          if (selectedMarkup?.foot === foot && selectedMarkup.index === contacts.length - 1) {
+                            setSelectedMarkup(null)
+                          } else {
+                            setSelectedMarkup({ foot, index: contacts.length - 1 })
+                          }
+                        }}
+                      >
+                        …2-я точка
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
             )}
           </div>
 
@@ -1578,12 +1945,14 @@ export default function App() {
             {!chartReady && (
               <div className="chart-empty">
                 {parquetData
-                  ? <><span>📊</span><p>Выберите колонки и нажмите <b>▶ Построить</b></p></>
+                  ? <><span>📊</span><p>Выберите колонки и нажмите <b>▶ Построить график</b></p></>
                   : <><span>📊</span><p>Загрузите <b>.parquet</b>-файл или введите номер сессии</p></>
                 }
               </div>
             )}
           </div>
+        </div>
+      </div>
         </div>
       </div>
 
@@ -1596,9 +1965,21 @@ export default function App() {
   )
 }
 
+function SidebarSection({ title, open, onToggle, children }) {
+  return (
+    <section className="sidebar-section">
+      <button type="button" className="sidebar-section-head" onClick={onToggle}>
+        <span className="sidebar-section-title">{title}</span>
+        <span className="sidebar-section-chevron">{open ? '▾' : '▸'}</span>
+      </button>
+      {open && <div className="sidebar-section-body">{children}</div>}
+    </section>
+  )
+}
+
 function UploadBtn({ accept, onFile, children }) {
   return (
-    <label className="btn-upload">
+    <label className="btn-upload btn-secondary">
       {children}
       <input type="file" accept={accept} hidden
         onChange={e => e.target.files[0] && onFile(e.target.files[0])} />

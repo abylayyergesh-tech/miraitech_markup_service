@@ -1,16 +1,90 @@
-# React + Vite
+# MiraiTech Markup Service
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Внутренний инструмент MiraiTech для синхронного просмотра видео и IMU-данных сессии, разметки фаз контакта стопы и подготовки обучающих датасетов.
 
-Currently, two official plugins are available:
+## Описание
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Сервис используется командой разработки и аналитики для работы с сырыми данными сенсоров вне основного пользовательского приложения. Загружается видео записи теста и данные сессии — из [MiraiTech Backend](../MiraiTech-backend) по ID или из локального `.parquet`-файла.
 
-## React Compiler
+На интерактивном графике (Plotly) отображаются показания стелек `ESP32_Sensor_1` и `ESP32_Sensor_2`: акселерометр, гироскоп и другие числовые колонки. Воспроизведение видео синхронизировано с курсором на графике — можно визуально сопоставить движение спортсмена с сигналом сенсора.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+В режиме разметки оператор отмечает интервалы контакта левой и правой стопы с опорой. Результат экспортируется в CSV с колонкой `Target` (0/1) для обучения ML-моделей, используемых в backend-анализе (каденс, контакт, прыжки).
 
-## Expanding the ESLint configuration
+## Ключевые возможности
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+- Авторизация через backend API (JWT)
+- Загрузка сессии по ID с автодополнением списка
+- Импорт локальных `.parquet` и видеофайлов (drag-and-drop)
+- Мультитрассовые графики Plotly с выбором колонок и сенсоров
+- Синхронизация видео и IMU (курсор, таймлайн, сдвиг S1/S2)
+- Визуализация пропусков в данных (`/api/check_hz`)
+- Разметка фаз контакта левой / правой ноги
+- Экспорт размеченного CSV
+
+## Требования
+
+- Node.js 18+
+- npm
+- Запущенный MiraiTech Backend (для загрузки сессий и авторизации)
+
+## Пример использования
+
+```bash
+# Установка зависимостей
+npm install
+
+# Запуск dev-сервера
+npm run dev
+```
+
+Приложение: http://localhost:5173
+
+```bash
+# Сборка
+npm run build
+npm run preview
+```
+
+**Типовой сценарий:**
+
+1. Войти с учётными данными backend.
+2. Загрузить видео теста и сессию (по ID или `.parquet`).
+3. Настроить колонки, сдвиги S1/S2, построить график.
+4. Включить режим разметки, отметить интервалы контакта.
+5. Экспортировать CSV с колонкой `Target`.
+
+## Технологический стек
+
+| Категория | Технологии |
+|-----------|------------|
+| UI | React 19, JavaScript (JSX) |
+| Сборка | Vite |
+| Графики | Plotly.js |
+| Данные | hyparquet (чтение Parquet в браузере) |
+| API | Fetch, прокси Vite → backend |
+
+## Структура проекта
+
+```
+miraitech_markup_service/
+├── src/
+│   ├── App.jsx       # Основной UI: видео, график, разметка
+│   ├── App.css
+│   └── main.jsx
+├── vite.config.js    # Прокси /api → backend
+└── package.json
+```
+
+## Конфигурация
+
+| Переменная | Описание |
+|------------|----------|
+| `VITE_API_BASE` | Базовый URL backend (пустая строка — использовать прокси Vite) |
+| `VITE_API_PROXY` | Target для прокси `/api` в `vite.config.js` (по умолчанию backend) |
+
+## Связанные проекты
+
+| Проект | Роль |
+|--------|------|
+| [MiraiTech Backend](../MiraiTech-backend) | API сессий, check_hz, авторизация |
+| [MiraiTech Frontend](../MiraiTech-frontend) | Основное пользовательское приложение |
