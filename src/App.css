@@ -958,6 +958,9 @@ body { background: var(--bg); overflow: hidden }
 .lab-btn.danger:hover   { background: #fef2f2 }
 .lab-btn.export         { border-color: #86efac; color: var(--green); font-weight: 600 }
 .lab-btn.export:hover   { background: #f0fdf4 }
+.lab-btn.import         { border-color: #93c5fd; color: var(--primary); font-weight: 600; cursor: pointer }
+.lab-btn.import:hover   { background: #eff6ff }
+label.lab-btn.import    { display: inline-flex; align-items: center; justify-content: center }
 .lab-btn.save-db        { background: var(--primary); color: #fff; border-color: var(--primary); font-weight: 600 }
 .lab-btn.save-db:hover  { background: #1d4ed8; color: #fff; border-color: #1d4ed8 }
 .lab-btn.save-db:disabled { opacity: .4; cursor: not-allowed; background: var(--primary); border-color: var(--primary) }
