@@ -193,6 +193,103 @@ function getPairStartIndex(index) {
   return index - (index % 2)
 }
 
+function parseCsvRow(line) {
+  const out = []
+  let cur = ''
+  let inQuotes = false
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]
+    if (inQuotes) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++ }
+        else inQuotes = false
+      } else cur += ch
+    } else if (ch === '"') {
+      inQuotes = true
+    } else if (ch === ',') {
+      out.push(cur)
+      cur = ''
+    } else {
+      cur += ch
+    }
+  }
+  out.push(cur)
+  return out
+}
+
+function parseCsvText(text) {
+  const lines = text.replace(/^\uFEFF/, '').trim().split(/\r?\n/)
+  if (!lines.length) throw new Error('CSV пустой')
+  const headers = parseCsvRow(lines[0]).map(h => h.trim())
+  const rows = []
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue
+    const vals = parseCsvRow(lines[i])
+    const row = {}
+    headers.forEach((h, j) => { row[h] = vals[j] ?? '' })
+    rows.push(row)
+  }
+  return { headers, rows }
+}
+
+function isTargetOne(v) {
+  if (v === 1 || v === '1' || v === 1.0) return true
+  const s = String(v ?? '').trim()
+  return s === '1' || s === '1.0'
+}
+
+function extractContactPairsFromTargetRuns(times, targets, offset = 0) {
+  const contacts = []
+  let i = 0
+  while (i < targets.length) {
+    while (i < targets.length && !isTargetOne(targets[i])) i++
+    if (i >= targets.length) break
+    const startT = safeNum(times[i])
+    if (startT === null) { i++; continue }
+    let endT = startT
+    while (i < targets.length && isTargetOne(targets[i])) {
+      const t = safeNum(times[i])
+      if (t !== null) endT = t
+      i++
+    }
+    contacts.push(startT + offset, endT + offset)
+  }
+  return contacts
+}
+
+function extractContactsFromLabeledCsv(rows, timeCol, leftSensor, rightSensor, offsetS1, offsetS2) {
+  const bySensor = (sensorName) => {
+    const filtered = rows
+      .filter(r => (r.Name || r.name) === sensorName)
+      .map(r => ({
+        t: safeNum(r[timeCol]),
+        target: r.Target ?? r.target ?? r.Label ?? r.label ?? '',
+      }))
+      .filter(r => r.t !== null)
+      .sort((a, b) => a.t - b.t)
+    return filtered
+  }
+
+  const leftRows = bySensor(leftSensor)
+  const rightRows = bySensor(rightSensor)
+  if (!leftRows.length && !rightRows.length) {
+    throw new Error(`Строки для сенсоров ${leftSensor} / ${rightSensor} не найдены`)
+  }
+
+  const leftContacts = extractContactPairsFromTargetRuns(
+    leftRows.map(r => r.t),
+    leftRows.map(r => r.target),
+    offsetS1,
+  )
+  const rightContacts = extractContactPairsFromTargetRuns(
+    rightRows.map(r => r.t),
+    rightRows.map(r => r.target),
+    offsetS2,
+  )
+
+  return { leftContacts, rightContacts, leftCount: leftContacts.length / 2, rightCount: rightContacts.length / 2 }
+}
+
 // ── Main App ───────────────────────────────────────────────────────────────
 export default function App() {
   // Auth
@@ -209,6 +306,7 @@ export default function App() {
   const [activeMarkupFileId, setActiveMarkupFileId] = useState('')
   const [sessionAdditionalInfo, setSessionAdditionalInfo] = useState(null)
   const [isSaving, setIsSaveLoading]    = useState(false)
+  const [pendingImportFilename, setPendingImportFilename] = useState('')
 
   // Sessions list (for autocomplete)
   const [sessionsList, setSessionsList]               = useState([])
@@ -302,6 +400,8 @@ export default function App() {
   const selectedMarkupRef = useRef(null)
   const relabelStepRef   = useRef(null)
   const zoomRangeRef     = useRef(null)
+  const importedCsvTextRef = useRef('')
+  const skipClearImportCsvRef = useRef(false)
 
   const insoleSensorNames = useMemo(
     () => sensorNames.filter(n => n !== SPEED_TRACKER),
@@ -330,6 +430,14 @@ export default function App() {
     const contacts = selectedMarkup.foot === 'left' ? leftContacts : rightContacts
     if (selectedMarkup.index >= contacts.length) setSelectedMarkup(null)
   }, [leftContacts, rightContacts, selectedMarkup])
+
+  useEffect(() => {
+    if (skipClearImportCsvRef.current) {
+      skipClearImportCsvRef.current = false
+      return
+    }
+    if (importedCsvTextRef.current) importedCsvTextRef.current = ''
+  }, [leftContacts, rightContacts])
 
   // ── Auth ──────────────────────────────────────────────────────────────────
   const handleLogin = useCallback(async (e) => {
@@ -413,6 +521,45 @@ export default function App() {
     return () => document.removeEventListener('mousedown', onDown)
   }, [labMenuOpen])
 
+  const fetchSessionMarkupsFromDb = useCallback(async (sid, { restoreLatest = false } = {}) => {
+    const resp = await fetch(`${API_BASE}/api/sessions/${sid}`, {
+      headers: {
+        'accept': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+    })
+    if (resp.status === 401) {
+      setToken('')
+      sessionStorage.removeItem('auth_token')
+      throw new Error('Сессия авторизации истекла — войдите снова')
+    }
+    if (!resp.ok) {
+      const errData = await resp.json().catch(() => ({}))
+      throw new Error(parseApiError(errData, resp.status))
+    }
+
+    const result = await resp.json()
+    setSessionAdditionalInfo(result.additional_info || null)
+    const files = result.additional_info?.markup_files || []
+    setMarkupFiles(files)
+
+    if (restoreLatest && files.length > 0) {
+      const lastFile = files[files.length - 1]
+      setActiveMarkupFileId(lastFile.id)
+      setLeftContacts(lastFile.leftContacts || [])
+      setRightContacts(lastFile.rightContacts || [])
+      importedCsvTextRef.current = lastFile.csv || ''
+      if (lastFile.meta) {
+        if (lastFile.meta.offsetS1 !== undefined) setOffsetS1(lastFile.meta.offsetS1)
+        if (lastFile.meta.offsetS2 !== undefined) setOffsetS2(lastFile.meta.offsetS2)
+        if (lastFile.meta.offsetST !== undefined) setOffsetST(lastFile.meta.offsetST)
+        if (lastFile.meta.timeUnit !== undefined) setTimeUnit(lastFile.meta.timeUnit)
+      }
+    }
+
+    return result
+  }, [token])
+
   // ── Session loader ────────────────────────────────────────────────────────
   const loadSession = useCallback(async () => {
     const sid = sessionId.trim()
@@ -427,6 +574,8 @@ export default function App() {
     setMarkupFiles([])
     setActiveMarkupFileId('')
     setSessionAdditionalInfo(null)
+    setPendingImportFilename('')
+    importedCsvTextRef.current = ''
     zoomRangeRef.current = null
     setRelabelStep(null)
     setShowLeftPatterns(true)
@@ -465,6 +614,7 @@ export default function App() {
         setActiveMarkupFileId(lastFile.id)
         setLeftContacts(lastFile.leftContacts || [])
         setRightContacts(lastFile.rightContacts || [])
+        importedCsvTextRef.current = lastFile.csv || ''
         if (lastFile.meta) {
           if (lastFile.meta.offsetS1 !== undefined) setOffsetS1(lastFile.meta.offsetS1)
           if (lastFile.meta.offsetS2 !== undefined) setOffsetS2(lastFile.meta.offsetS2)
@@ -663,14 +813,17 @@ export default function App() {
     const n = timeArr.length
     const rightSensorName = insoleSensorNames[1] || 'ESP32_Sensor_2'
 
-    const buildIv = (contacts) => {
+    const buildIv = (contacts, offset) => {
       const out = []
       for (let i = 0; i + 1 < contacts.length; i += 2)
-        out.push([Math.min(contacts[i], contacts[i + 1]), Math.max(contacts[i], contacts[i + 1])])
+        out.push([
+          Math.min(contacts[i], contacts[i + 1]) - offset,
+          Math.max(contacts[i], contacts[i + 1]) - offset,
+        ])
       return out
     }
-    const lIv = buildIv(leftContactsRef.current)
-    const rIv = buildIv(rightContactsRef.current)
+    const lIv = buildIv(leftContactsRef.current, offsetS1Ref.current)
+    const rIv = buildIv(rightContactsRef.current, offsetS2Ref.current)
     const inIv = (t, ivs) => {
       const tv = safeNum(t); if (tv === null) return false
       return ivs.some(([a, b]) => tv >= a && tv <= b)
@@ -711,6 +864,8 @@ export default function App() {
 
   const handleSelectMarkupFile = useCallback((id) => {
     setRelabelStep(null)
+    setPendingImportFilename('')
+    importedCsvTextRef.current = ''
     if (id === 'new' || !id) {
       setActiveMarkupFileId('new')
       setLeftContacts([])
@@ -722,6 +877,7 @@ export default function App() {
       setActiveMarkupFileId(file.id)
       setLeftContacts(file.leftContacts || [])
       setRightContacts(file.rightContacts || [])
+      importedCsvTextRef.current = file.csv || ''
       if (file.meta) {
         if (file.meta.offsetS1 !== undefined) setOffsetS1(file.meta.offsetS1)
         if (file.meta.offsetS2 !== undefined) setOffsetS2(file.meta.offsetS2)
@@ -733,34 +889,54 @@ export default function App() {
 
   const saveMarkupToDb = useCallback(async () => {
     const sid = sessionId.trim()
-    if (!sid) return
+    if (!sid) {
+      setStatus({ text: 'Укажите ID сессии в поле слева', type: 'error' })
+      return
+    }
+    if (leftContactsRef.current.length === 0 && rightContactsRef.current.length === 0) {
+      setStatus({ text: 'Нет разметки для сохранения', type: 'error' })
+      return
+    }
 
     setIsSaveLoading(true)
     try {
-      const csv = generateCsvString()
+      const currentSession = await fetchSessionMarkupsFromDb(sid)
+      const currentAdditionalInfo = currentSession.additional_info || {}
+      const existingMarkupFiles = Array.isArray(currentAdditionalInfo.markup_files)
+        ? [...currentAdditionalInfo.markup_files]
+        : []
+
       const isNew = !activeMarkupFileId || activeMarkupFileId === 'new'
       const fileId = isNew ? `mf_${Date.now()}` : activeMarkupFileId
-      const fileIndex = isNew ? -1 : markupFiles.findIndex(f => f.id === fileId)
-      
+      const fileIndex = isNew ? -1 : existingMarkupFiles.findIndex(f => f.id === fileId)
+
+      const csv = (isNew && importedCsvTextRef.current)
+        ? importedCsvTextRef.current
+        : generateCsvString()
+      if (!csv) throw new Error('Не удалось сформировать CSV')
+
+      const defaultFilename = pendingImportFilename
+        || `markup_${sid}_v${existingMarkupFiles.length + 1}.csv`
+
       const newFile = {
         id: fileId,
         filename: !isNew && fileIndex >= 0
-          ? markupFiles[fileIndex].filename 
-          : `markup_${sid}_v${markupFiles.length + 1}.csv`,
+          ? existingMarkupFiles[fileIndex].filename
+          : defaultFilename,
         type: 'contact_target_csv',
         updated_at: new Date().toISOString(),
-        leftContacts: leftContactsRef.current,
-        rightContacts: rightContactsRef.current,
+        leftContacts: [...leftContactsRef.current],
+        rightContacts: [...rightContactsRef.current],
         meta: {
           offsetS1: offsetS1Ref.current,
           offsetS2: offsetS2Ref.current,
           offsetST: offsetSTRef.current,
           timeUnit: timeUnitRef.current,
         },
-        csv: csv,
+        csv,
       }
 
-      let updatedFiles = [...markupFiles]
+      const updatedFiles = [...existingMarkupFiles]
       if (fileIndex >= 0) {
         updatedFiles[fileIndex] = newFile
       } else {
@@ -768,39 +944,135 @@ export default function App() {
       }
 
       const updatedAdditionalInfo = {
-        ...(sessionAdditionalInfo || {}),
-        markup_files: updatedFiles
+        ...currentAdditionalInfo,
+        markup_files: updatedFiles,
       }
 
       const resp = await fetch(`${API_BASE}/api/sessions/${sid}`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
+          'accept': 'application/json',
           'Authorization': `Bearer ${token}`,
         },
         body: JSON.stringify({
-          additional_info: updatedAdditionalInfo
-        })
+          additional_info: updatedAdditionalInfo,
+        }),
       })
 
       if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}: ${resp.statusText}`)
+        const errData = await resp.json().catch(() => ({}))
+        throw new Error(parseApiError(errData, resp.status))
       }
 
       const updatedSession = await resp.json()
-      
+
       setSessionAdditionalInfo(updatedSession.additional_info || null)
       const nextFiles = updatedSession.additional_info?.markup_files || updatedFiles
       setMarkupFiles(nextFiles)
       setActiveMarkupFileId(fileId)
-      
-      setStatus({ text: '✓ Разметка успешно сохранена в БД', type: 'ok' })
+      setPendingImportFilename('')
+      importedCsvTextRef.current = csv
+
+      setStatus({
+        text: `✓ Разметка «${newFile.filename}» сохранена в БД (${nextFiles.length} верс.)`,
+        type: 'ok',
+      })
     } catch (err) {
       setStatus({ text: `Ошибка сохранения: ${err.message}`, type: 'error' })
     } finally {
       setIsSaveLoading(false)
     }
-  }, [sessionId, activeMarkupFileId, markupFiles, sessionAdditionalInfo, generateCsvString, token])
+  }, [
+    sessionId,
+    activeMarkupFileId,
+    generateCsvString,
+    token,
+    pendingImportFilename,
+    fetchSessionMarkupsFromDb,
+  ])
+
+  const importLabeledCsv = useCallback(async (file) => {
+    if (!parquetData) {
+      setStatus({ text: 'Сначала загрузите сессию или parquet', type: 'error' })
+      return
+    }
+
+    const sid = sessionId.trim()
+    if (!sid) {
+      setStatus({ text: 'Укажите ID сессии (например 4102) — без него сохранение в БД невозможно', type: 'error' })
+      return
+    }
+
+    setStatus({ text: `Читаю разметку ${file.name}…`, type: 'loading' })
+    setRelabelStep(null)
+    setSelectedMarkup(null)
+
+    try {
+      if (token) {
+        await fetchSessionMarkupsFromDb(sid)
+      }
+
+      const text = await file.text()
+      const { headers, rows } = parseCsvText(text)
+
+      const tCol = headers.find(c => c === 'Time')
+        || headers.find(c => ['time', 'timestamp', 'Timestamp', 't'].includes(c))
+      if (!tCol) throw new Error('Колонка Time не найдена в CSV')
+
+      const hasTarget = headers.some(c => ['Target', 'target', 'Label', 'label'].includes(c))
+      if (!hasTarget) throw new Error('Колонка Target не найдена — это не размеченный CSV')
+
+      const leftSensor = insoleSensorNames[0]
+      const rightSensor = insoleSensorNames[1]
+      if (!leftSensor) throw new Error('В данных сессии нет сенсоров стельки')
+
+      const csvNames = new Set(rows.map(r => r.Name || r.name).filter(Boolean))
+      const resolveSensor = (preferred, fallback) => {
+        if (csvNames.has(preferred)) return preferred
+        if (fallback && csvNames.has(fallback)) return fallback
+        return preferred
+      }
+      const leftName = resolveSensor(leftSensor, 'ESP32_Sensor_1')
+      const rightName = rightSensor
+        ? resolveSensor(rightSensor, 'ESP32_Sensor_2')
+        : null
+
+      const { leftContacts: importedLeft, rightContacts: importedRight, leftCount, rightCount } =
+        extractContactsFromLabeledCsv(
+          rows,
+          tCol,
+          leftName,
+          rightName || '__none__',
+          offsetS1Ref.current,
+          offsetS2Ref.current,
+        )
+
+      if (leftCount === 0 && rightCount === 0) {
+        throw new Error('В CSV нет интервалов с Target=1')
+      }
+
+      setLeftContacts(importedLeft)
+      setRightContacts(importedRight)
+      setActiveMarkupFileId('new')
+      setPendingImportFilename(file.name.replace(/\.csv$/i, '') + '.csv')
+      skipClearImportCsvRef.current = true
+      importedCsvTextRef.current = text
+      setLabelingMode(true)
+      setShowLeftPatterns(true)
+      setShowRightPatterns(true)
+      if (!sessionLabel.startsWith('Сессия #')) {
+        setSessionLabel(`Сессия #${sid}`)
+      }
+
+      setStatus({
+        text: `✓ Импорт ${file.name}: S1 ${leftCount} · S2 ${rightCount}. Нажмите «Сохранить в БД».`,
+        type: 'ok',
+      })
+    } catch (err) {
+      setStatus({ text: `Ошибка импорта CSV: ${err.message}`, type: 'error' })
+    }
+  }, [parquetData, insoleSensorNames, sessionId, token, fetchSessionMarkupsFromDb, sessionLabel])
 
   // ── Video zoom helpers ────────────────────────────────────────────────────
   const clampPan = useCallback((z, px, py) => {
@@ -919,6 +1191,9 @@ export default function App() {
     setSelectedMarkup(null)
     anglesUnwrappedRef.current = false
     setAnglesUnwrapped(false)
+    importedCsvTextRef.current = ''
+    setPendingImportFilename('')
+    setActiveMarkupFileId('')
 
     try {
       const arrayBuffer = await file.arrayBuffer()
@@ -956,17 +1231,28 @@ export default function App() {
 
       const stHint = hasST ? ' · SpeedTracker' : ''
       setStatus({ text: `✓ ${rows.length} строк · ${numCols.length} колонок · ${autoUnit}${stHint}`, type: 'ok' })
+
+      const sid = sessionId.trim()
+      if (sid && token) {
+        try {
+          await fetchSessionMarkupsFromDb(sid)
+          setSessionLabel(`Сессия #${sid} · ${file.name}`)
+        } catch {
+          // parquet loaded; markups will load on save
+        }
+      }
     } catch (err) {
       setStatus({ text: `Ошибка чтения parquet: ${err.message}`, type: 'error' })
     }
-  }, [])
+  }, [sessionId, token, fetchSessionMarkupsFromDb])
 
   const handleFiles = useCallback((files) => {
     ;[...files].forEach(f => {
       if (f.type.startsWith('video/') || /\.(mp4|webm|mov|avi|mkv)$/i.test(f.name)) loadVideo(f)
       else if (/\.parquet$/i.test(f.name)) loadParquetFile(f)
+      else if (/\.csv$/i.test(f.name)) importLabeledCsv(f)
     })
-  }, [loadVideo, loadParquetFile])
+  }, [loadVideo, loadParquetFile, importLabeledCsv])
 
   // ── Build Plotly chart ────────────────────────────────────────────────────
   const renderChart = useCallback(() => {
@@ -1363,6 +1649,9 @@ export default function App() {
                     <UploadBtn accept=".parquet" onFile={loadParquetFile}>
                       📊 Parquet
                     </UploadBtn>
+                    <UploadBtn accept=".csv,text/csv" onFile={importLabeledCsv}>
+                      📋 CSV
+                    </UploadBtn>
                   </div>
 
                   <div className="sidebar-field">
@@ -1710,19 +1999,21 @@ export default function App() {
               </div>
 
               <div className="label-toolbar-group label-toolbar-actions">
-                {markupFiles.length > 0 && (
+                {(markupFiles.length > 0 || activeMarkupFileId === 'new' || pendingImportFilename) && (
                   <select
                     className="select-sm markup-file-select"
-                    value={activeMarkupFileId}
+                    value={activeMarkupFileId || 'new'}
                     onChange={e => handleSelectMarkupFile(e.target.value)}
-                    title="Выберите версию разметки"
+                    title="Выберите версию разметки из БД"
                   >
                     {markupFiles.map(f => (
                       <option key={f.id} value={f.id}>
-                        {f.filename} ({new Date(f.updated_at).toLocaleTimeString()})
+                        {f.filename} ({new Date(f.updated_at).toLocaleString()})
                       </option>
                     ))}
-                    <option value="new">+ Новая разметка</option>
+                    <option value="new">
+                      {pendingImportFilename ? `⬆ ${pendingImportFilename}` : '+ Новая разметка'}
+                    </option>
                   </select>
                 )}
                 {labelingMode && (
@@ -1736,11 +2027,24 @@ export default function App() {
                   type="button"
                   className="btn-primary lab-btn save-db"
                   onClick={saveMarkupToDb}
-                  disabled={isSaving || !sessionId.trim()}
-                  title="Сохранить текущую разметку в БД"
+                  disabled={isSaving || !sessionId.trim() || totalContacts === 0}
+                  title={!sessionId.trim()
+                    ? 'Укажите ID сессии слева (например 4102)'
+                    : 'Сохранить текущую разметку в БД (сессия #' + sessionId.trim() + ')'}
                 >
                   {isSaving ? 'Сохранение…' : '💾 Сохранить в БД'}
                 </button>
+                <UploadBtn
+                  accept=".csv,text/csv"
+                  onFile={importLabeledCsv}
+                  className="btn-secondary lab-btn import"
+                  disabled={!parquetData}
+                  title={parquetData
+                    ? 'Загрузить размеченный CSV (Target) и восстановить интервалы на графике'
+                    : 'Сначала загрузите сессию или parquet'}
+                >
+                  ⬆ CSV
+                </UploadBtn>
                 <button
                   type="button"
                   className="btn-secondary lab-btn export"
@@ -1958,7 +2262,7 @@ export default function App() {
 
       {dragOver && (
         <div className="drag-overlay">
-          <div className="drag-box">⬇<p>Видео или .parquet</p></div>
+          <div className="drag-box">⬇<p>Видео, .parquet или размеченный .csv</p></div>
         </div>
       )}
     </div>
@@ -1977,12 +2281,24 @@ function SidebarSection({ title, open, onToggle, children }) {
   )
 }
 
-function UploadBtn({ accept, onFile, children }) {
+function UploadBtn({ accept, onFile, children, className = 'btn-upload btn-secondary', disabled = false, title }) {
   return (
-    <label className="btn-upload btn-secondary">
+    <label
+      className={`${className}${disabled ? ' disabled' : ''}`}
+      title={title}
+      style={disabled ? { opacity: 0.4, pointerEvents: 'none', cursor: 'not-allowed' } : undefined}
+    >
       {children}
-      <input type="file" accept={accept} hidden
-        onChange={e => e.target.files[0] && onFile(e.target.files[0])} />
+      <input
+        type="file"
+        accept={accept}
+        hidden
+        disabled={disabled}
+        onChange={e => {
+          if (e.target.files[0]) onFile(e.target.files[0])
+          e.target.value = ''
+        }}
+      />
     </label>
   )
 }
