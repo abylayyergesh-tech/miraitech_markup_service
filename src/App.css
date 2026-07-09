@@ -102,6 +102,9 @@ body { background: var(--bg); overflow: hidden }
   border: 1px solid var(--border);
   border-radius: var(--radius);
   overflow: hidden;
+  /* overflow:hidden lets flex items shrink below content height, which
+     silently clips section bottoms instead of scrolling .sidebar-scroll. */
+  flex-shrink: 0;
 }
 
 .sidebar-section-head {
@@ -143,6 +146,13 @@ body { background: var(--bg); overflow: hidden }
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+.sidebar-block-row {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 12px;
 }
 
 .sidebar-block-lbl,
@@ -558,6 +568,23 @@ body { background: var(--bg); overflow: hidden }
 }
 .btn-secondary.btn-speed-predict.active:hover { background: #fbdbd7 }
 .btn-secondary.btn-speed-predict:disabled { opacity: .4; cursor: not-allowed }
+
+/* Compact distance-predict button (mirrors btn-speed-predict) */
+.btn-secondary.btn-distance-predict {
+  align-self: flex-start;
+  padding: 3px 9px;
+  font-size: 11px;
+  font-weight: 600;
+  gap: 4px;
+  border-radius: 5px;
+}
+.btn-secondary.btn-distance-predict.active {
+  background: #fdecea;
+  color: #b3231d;
+  border-color: #e79a95;
+}
+.btn-secondary.btn-distance-predict.active:hover { background: #fbdbd7 }
+.btn-secondary.btn-distance-predict:disabled { opacity: .4; cursor: not-allowed }
 
 /* ── Content area: side-by-side ─────────────────────────────────────── */
 .content {
