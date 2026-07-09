@@ -34,8 +34,10 @@ const ST_COL_COLORS = {
   Distance: '#9467bd',    // purple
   DistanceM: '#9467bd',
 }
-// Speed-predict overlay (charts/sprint-speed): drawn on top of the speed subplot.
+// Speed/Distance-predict overlays (charts/sprint-speed): drawn on top of their
+// respective subplots. Both read from the same fetched series.
 const SPEED_PRED_COLS = new Set(['Speed', 'VelocityMs'])
+const DISTANCE_PRED_COLS = new Set(['Distance', 'DistanceM'])
 const PRED_COLOR = '#d62728'
 
 function parseSessionRows(raw) {
@@ -108,6 +110,68 @@ function buildDefaultCols(numCols, hasSpeedTracker) {
   const merged = [...imu]
   st.forEach(c => { if (!merged.includes(c)) merged.push(c) })
   return merged.length ? merged : numCols.slice(0, 3)
+}
+
+// Derived channel: TKEO of the accel magnitude, mirroring the backend
+// (ml_speed_calculator._foot_features / build_session_parquets._tkeo):
+// psi[i] = x[i]² − x[i−1]·x[i+1], centered rolling mean over
+// max(3, round(0.03 s · fs)) samples, clamped to ≥ 0 after smoothing.
+// Computed per sensor (rows are interleaved across sensors) in time order.
+function addAccTkeoColumn(colMap, tCol) {
+  if (colMap['acc_tkeo']) return // parquet already carries it
+  const { AcX, AcY, AcZ } = colMap
+  const times = colMap[tCol]
+  const names = colMap['Name']
+  if (!AcX || !AcY || !AcZ || !times) return
+
+  const n = times.length
+  const out = new Array(n).fill(null)
+  const sensors = names
+    ? [...new Set(names.filter(v => v != null && v !== ''))]
+    : [null]
+
+  sensors.forEach(sensor => {
+    const idx = []
+    for (let i = 0; i < n; i++) {
+      if (sensor !== null && names[i] !== sensor) continue
+      if (safeNum(times[i]) === null) continue
+      if (safeNum(AcX[i]) === null || safeNum(AcY[i]) === null || safeNum(AcZ[i]) === null) continue
+      idx.push(i)
+    }
+    if (idx.length < 3) return
+    idx.sort((a, b) => safeNum(times[a]) - safeNum(times[b]))
+
+    const t   = idx.map(i => safeNum(times[i]))
+    const mag = idx.map(i => Math.hypot(safeNum(AcX[i]), safeNum(AcY[i]), safeNum(AcZ[i])))
+
+    // Sample rate from the median dt; Time can be ms or s (~500 Hz either way).
+    const dts = []
+    for (let k = 1; k < t.length; k++) { const d = t[k] - t[k - 1]; if (d > 0) dts.push(d) }
+    if (!dts.length) return
+    dts.sort((a, b) => a - b)
+    let dt = dts[Math.floor(dts.length / 2)]
+    if (dt > 0.5) dt /= 1000 // ms → s
+    const fs = 1 / dt
+
+    const m = mag.length
+    const psi = new Array(m).fill(0)
+    for (let k = 1; k < m - 1; k++) psi[k] = mag[k] * mag[k] - mag[k - 1] * mag[k + 1]
+
+    // pandas rolling(win, center=True, min_periods=1): [k−⌊win/2⌋, k+⌊(win−1)/2⌋]
+    const win  = Math.max(3, Math.round(0.03 * fs))
+    const back = Math.floor(win / 2)
+    const fwd  = Math.floor((win - 1) / 2)
+    const cum = new Array(m + 1)
+    cum[0] = 0
+    for (let k = 0; k < m; k++) cum[k + 1] = cum[k] + psi[k]
+    for (let k = 0; k < m; k++) {
+      const lo = Math.max(0, k - back)
+      const hi = Math.min(m - 1, k + fwd)
+      out[idx[k]] = Math.max((cum[hi + 1] - cum[lo]) / (hi - lo + 1), 0)
+    }
+  })
+
+  colMap['acc_tkeo'] = out
 }
 
 const L_FILL = 'rgba(31,119,180,0.35)'
@@ -337,7 +401,9 @@ export default function App() {
   const [showSensor2, setShowSensor2]   = useState(true)
   const [showSpeedTracker, setShowSpeedTracker] = useState(false)
   const [speedPredict, setSpeedPredict] = useState(null)
-  const [speedPredictLoading, setSpeedPredictLoading] = useState(false)
+  const [predictLoading, setPredictLoading] = useState(false)
+  const [showSpeedPredict, setShowSpeedPredict] = useState(false)
+  const [showDistancePredict, setShowDistancePredict] = useState(false)
   const [checkHzData, setCheckHzData]   = useState(null)
   const [selectedCols, setSelectedCols] = useState([])
   const [timeCol, setTimeCol]           = useState('Time')
@@ -596,6 +662,8 @@ export default function App() {
     setShowSensor2(true)
     setShowSpeedTracker(false)
     setSpeedPredict(null)
+    setShowSpeedPredict(false)
+    setShowDistancePredict(false)
     setOffsetST(0)
     setShowGaps(false)
     setCheckHzData(null)
@@ -641,10 +709,9 @@ export default function App() {
       if (!rows?.length) { setStatus({ text: 'Сессия пустая', type: 'error' }); return }
 
       const colMap = rowsToColMap(rows)
+      const tCol = detectTimeCol(Object.keys(colMap))
+      addAccTkeoColumn(colMap, tCol)
       setParquetData(colMap)
-
-      const allCols = Object.keys(colMap)
-      const tCol = detectTimeCol(allCols)
       setTimeCol(tCol)
 
       const names = sortSensorNames(colMap)
@@ -1199,6 +1266,8 @@ export default function App() {
     setShowSensor2(true)
     setShowSpeedTracker(false)
     setSpeedPredict(null)
+    setShowSpeedPredict(false)
+    setShowDistancePredict(false)
     setOffsetST(0)
     setShowGaps(false)
     setCheckHzData(null)
@@ -1220,10 +1289,9 @@ export default function App() {
       rows.forEach(row => Object.entries(row).forEach(([k, v]) => {
         colMap[k].push(typeof v === 'bigint' ? Number(v) : v)
       }))
+      const tCol = detectTimeCol(Object.keys(colMap))
+      addAccTkeoColumn(colMap, tCol)
       setParquetData(colMap)
-
-      const allCols = Object.keys(colMap)
-      const tCol = detectTimeCol(allCols)
       setTimeCol(tCol)
 
       const names = sortSensorNames(colMap)
@@ -1268,18 +1336,17 @@ export default function App() {
     })
   }, [loadVideo, loadParquetFile, importLabeledCsv])
 
-  // ── Speed predict (charts/sprint-speed) ──────────────────────────────────
-  const fetchSpeedPredict = useCallback(async () => {
-    // Toggle off if already loaded.
-    if (speedPredict) { setSpeedPredict(null); return }
+  // ── Speed/Distance predict (charts/sprint-speed) ─────────────────────────
+  // Both overlays read the same fetched series (it carries speed AND
+  // distance per point) — whichever button is clicked first fetches, the
+  // other reuses the cached result. Visibility is toggled independently.
+  const ensurePredictSeries = useCallback(async () => {
+    if (speedPredict) return speedPredict
 
     const sid = sessionId.trim()
-    if (!sid) {
-      setStatus({ text: 'Укажите ID сессии — прогноз скорости берётся по сессии', type: 'error' })
-      return
-    }
+    if (!sid) throw new Error('Укажите ID сессии — прогноз берётся по сессии')
 
-    setSpeedPredictLoading(true)
+    setPredictLoading(true)
     try {
       const resp = await fetch(`${API_BASE}/api/sessions/${sid}/charts/sprint-speed`, {
         headers: { 'accept': 'application/json', 'Authorization': `Bearer ${token}` },
@@ -1295,15 +1362,25 @@ export default function App() {
       }
       const data = await resp.json()
       if (!data?.data_points?.length) {
-        setStatus({ text: 'В charts/sprint-speed нет точек скорости для этой сессии', type: 'error' })
-        return
+        throw new Error('В charts/sprint-speed нет точек для этой сессии')
       }
+      setSpeedPredict(data)
+      return data
+    } finally {
+      setPredictLoading(false)
+    }
+  }, [speedPredict, sessionId, token])
+
+  const fetchSpeedPredict = useCallback(async () => {
+    if (showSpeedPredict) { setShowSpeedPredict(false); return }
+    try {
+      const data = await ensurePredictSeries()
       // Make sure a speed subplot exists to overlay onto.
       const speedCol = columns.find(c => SPEED_PRED_COLS.has(c))
       if (speedCol && !selectedCols.includes(speedCol)) {
         setSelectedCols(prev => [...prev, speedCol])
       }
-      setSpeedPredict(data)
+      setShowSpeedPredict(true)
       const peak = data.stat?.peak_speed
       setStatus({
         text: `✓ speed predict: ${data.data_points.length} точек${peak != null ? ` · пик ${peak.toFixed(2)} m/s` : ''}`,
@@ -1311,10 +1388,28 @@ export default function App() {
       })
     } catch (err) {
       setStatus({ text: `Ошибка speed predict: ${err.message}`, type: 'error' })
-    } finally {
-      setSpeedPredictLoading(false)
     }
-  }, [speedPredict, sessionId, token, columns, selectedCols])
+  }, [showSpeedPredict, ensurePredictSeries, columns, selectedCols])
+
+  const fetchDistancePredict = useCallback(async () => {
+    if (showDistancePredict) { setShowDistancePredict(false); return }
+    try {
+      const data = await ensurePredictSeries()
+      // Make sure a distance subplot exists to overlay onto.
+      const distCol = columns.find(c => DISTANCE_PRED_COLS.has(c))
+      if (distCol && !selectedCols.includes(distCol)) {
+        setSelectedCols(prev => [...prev, distCol])
+      }
+      setShowDistancePredict(true)
+      const dist = data.stat?.distance_at_peak_speed
+      setStatus({
+        text: `✓ distance predict: ${data.data_points.length} точек${dist != null ? ` · на пике скорости ${dist.toFixed(1)} м` : ''}`,
+        type: 'ok',
+      })
+    } catch (err) {
+      setStatus({ text: `Ошибка distance predict: ${err.message}`, type: 'error' })
+    }
+  }, [showDistancePredict, ensurePredictSeries, columns, selectedCols])
 
   // ── Build Plotly chart ────────────────────────────────────────────────────
   const renderChart = useCallback(() => {
@@ -1442,7 +1537,7 @@ export default function App() {
       // Speed-predict overlay (charts/sprint-speed) on top of the speed subplot.
       // Backend time is seconds (raw device Time / 1000); the ST trace here plots
       // rawTime + offsetST, so rawTime = point.time * 1000 realigns the two.
-      if (SPEED_PRED_COLS.has(col) && speedPredict?.data_points?.length) {
+      if (SPEED_PRED_COLS.has(col) && showSpeedPredict && speedPredict?.data_points?.length) {
         const shiftST = offsetSTRef.current
         const toX = (tSec) => tSec * 1000 + shiftST
         traces.push({
@@ -1460,6 +1555,32 @@ export default function App() {
             x: [toX(st.timestep_at_peak_speed)],
             y: [st.peak_speed],
             name: `пик ${st.peak_speed.toFixed(2)} m/s`,
+            type: 'scatter', mode: 'markers',
+            xaxis: xAxis, yaxis: yAxis,
+            marker: { color: PRED_COLOR, size: 11, symbol: 'star', line: { color: '#fff', width: 1 } },
+          })
+        }
+      }
+
+      // Distance-predict overlay (same fetched series, cumulative distance).
+      if (DISTANCE_PRED_COLS.has(col) && showDistancePredict && speedPredict?.data_points?.length) {
+        const shiftST = offsetSTRef.current
+        const toX = (tSec) => tSec * 1000 + shiftST
+        traces.push({
+          x: speedPredict.data_points.map(p => toX(p.time)),
+          y: speedPredict.data_points.map(p => p.distance),
+          name: 'distance predict',
+          type: 'scatter', mode: 'lines',
+          xaxis: xAxis, yaxis: yAxis,
+          line: { color: PRED_COLOR, width: 2 },
+          connectgaps: false,
+        })
+        const st = speedPredict.stat
+        if (st && st.distance_at_peak_speed != null && st.timestep_at_peak_speed != null) {
+          traces.push({
+            x: [toX(st.timestep_at_peak_speed)],
+            y: [st.distance_at_peak_speed],
+            name: `${st.distance_at_peak_speed.toFixed(1)} м на пике скорости`,
             type: 'scatter', mode: 'markers',
             xaxis: xAxis, yaxis: yAxis,
             marker: { color: PRED_COLOR, size: 11, symbol: 'star', line: { color: '#fff', width: 1 } },
@@ -1569,7 +1690,7 @@ export default function App() {
         }
       })
     })
-  }, [parquetData, selectedCols, timeCol, insoleSensorNames, hasSpeedTracker, offsetS1, offsetS2, offsetST, showSpeedTracker, updateOverlayShapes, showSensor1, showSensor2, speedPredict])
+  }, [parquetData, selectedCols, timeCol, insoleSensorNames, hasSpeedTracker, offsetS1, offsetS2, offsetST, showSpeedTracker, updateOverlayShapes, showSensor1, showSensor2, speedPredict, showSpeedPredict, showDistancePredict])
 
   const handleUnwrapAngles = useCallback(() => {
     if (!parquetData || !selectedCols.length) return
@@ -1872,53 +1993,95 @@ export default function App() {
                     )}
 
                     {hasSpeedTracker && (
-                      <div className="sidebar-block">
-                        <span className="sidebar-block-lbl">Прогноз скорости</span>
-                        <button
-                          type="button"
-                          className={`btn-secondary btn-speed-predict${speedPredict ? ' active' : ''}`}
-                          onClick={fetchSpeedPredict}
-                          disabled={speedPredictLoading || !sessionId.trim()}
-                          title={!sessionId.trim()
-                            ? 'Укажите ID сессии — прогноз берётся по сессии (charts/sprint-speed)'
-                            : speedPredict
-                              ? 'Убрать прогноз скорости с графика'
-                              : 'Загрузить charts/sprint-speed и наложить поверх колонки Speed'}
-                        >
-                          {speedPredictLoading
-                            ? '⏳ Загрузка…'
-                            : speedPredict
-                              ? '✕ Убрать speed predict'
-                              : '⚡ Speed predict'}
-                        </button>
-                        {speedPredict?.stat && (
-                          <span className="hz-stats hz-stats-compact" style={{ '--hzc': PRED_COLOR }}>
-                            {speedPredict.stat.peak_speed != null && (
-                              <span className="hz-stat-item" title="пиковая скорость">
-                                <span className="hz-stat-key">пик</span>
-                                <span className="hz-stat-val">{speedPredict.stat.peak_speed.toFixed(2)}</span>
-                              </span>
-                            )}
-                            {speedPredict.stat.average_speed != null && (
-                              <>
-                                <span className="hz-stat-sep" />
-                                <span className="hz-stat-item" title="средняя скорость на участке 30 м">
-                                  <span className="hz-stat-key">ср</span>
-                                  <span className="hz-stat-val">{speedPredict.stat.average_speed.toFixed(2)}</span>
+                      <div className="sidebar-block-row">
+                        <div className="sidebar-block">
+                          <span className="sidebar-block-lbl">Прогноз скорости</span>
+                          <button
+                            type="button"
+                            className={`btn-secondary btn-speed-predict${showSpeedPredict ? ' active' : ''}`}
+                            onClick={fetchSpeedPredict}
+                            disabled={predictLoading || !sessionId.trim()}
+                            title={!sessionId.trim()
+                              ? 'Укажите ID сессии — прогноз берётся по сессии (charts/sprint-speed)'
+                              : showSpeedPredict
+                                ? 'Убрать прогноз скорости с графика'
+                                : 'Загрузить charts/sprint-speed и наложить поверх колонки Speed'}
+                          >
+                            {predictLoading
+                              ? '⏳ Загрузка…'
+                              : showSpeedPredict
+                                ? '✕ Убрать speed predict'
+                                : '⚡ Speed predict'}
+                          </button>
+                          {showSpeedPredict && speedPredict?.stat && (
+                            <span className="hz-stats hz-stats-compact" style={{ '--hzc': PRED_COLOR }}>
+                              {speedPredict.stat.peak_speed != null && (
+                                <span className="hz-stat-item" title="пиковая скорость">
+                                  <span className="hz-stat-key">пик</span>
+                                  <span className="hz-stat-val">{speedPredict.stat.peak_speed.toFixed(2)}</span>
                                 </span>
-                              </>
-                            )}
-                            {speedPredict.stat.duration != null && (
-                              <>
-                                <span className="hz-stat-sep" />
-                                <span className="hz-stat-item" title="время прохождения 30 м, с">
-                                  <span className="hz-stat-key">30м</span>
-                                  <span className="hz-stat-val">{speedPredict.stat.duration.toFixed(2)}с</span>
+                              )}
+                              {speedPredict.stat.average_speed != null && (
+                                <>
+                                  <span className="hz-stat-sep" />
+                                  <span className="hz-stat-item" title="средняя скорость на участке 30 м">
+                                    <span className="hz-stat-key">ср</span>
+                                    <span className="hz-stat-val">{speedPredict.stat.average_speed.toFixed(2)}</span>
+                                  </span>
+                                </>
+                              )}
+                              {speedPredict.stat.duration != null && (
+                                <>
+                                  <span className="hz-stat-sep" />
+                                  <span className="hz-stat-item" title="время прохождения 30 м, с">
+                                    <span className="hz-stat-key">30м</span>
+                                    <span className="hz-stat-val">{speedPredict.stat.duration.toFixed(2)}с</span>
+                                  </span>
+                                </>
+                              )}
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="sidebar-block">
+                          <span className="sidebar-block-lbl">Прогноз дистанции</span>
+                          <button
+                            type="button"
+                            className={`btn-secondary btn-distance-predict${showDistancePredict ? ' active' : ''}`}
+                            onClick={fetchDistancePredict}
+                            disabled={predictLoading || !sessionId.trim()}
+                            title={!sessionId.trim()
+                              ? 'Укажите ID сессии — прогноз берётся по сессии (charts/sprint-speed)'
+                              : showDistancePredict
+                                ? 'Убрать прогноз дистанции с графика'
+                                : 'Загрузить charts/sprint-speed и наложить поверх колонки Distance'}
+                          >
+                            {predictLoading
+                              ? '⏳ Загрузка…'
+                              : showDistancePredict
+                                ? '✕ Убрать distance predict'
+                                : '📏 Distance predict'}
+                          </button>
+                          {showDistancePredict && speedPredict?.stat && (
+                            <span className="hz-stats hz-stats-compact" style={{ '--hzc': PRED_COLOR }}>
+                              {speedPredict.stat.distance_at_peak_speed != null && (
+                                <span className="hz-stat-item" title="дистанция на момент пика скорости">
+                                  <span className="hz-stat-key">на пике</span>
+                                  <span className="hz-stat-val">{speedPredict.stat.distance_at_peak_speed.toFixed(1)}м</span>
                                 </span>
-                              </>
-                            )}
-                          </span>
-                        )}
+                              )}
+                              {speedPredict.stat.duration != null && (
+                                <>
+                                  <span className="hz-stat-sep" />
+                                  <span className="hz-stat-item" title="время прохождения 30 м, с">
+                                    <span className="hz-stat-key">30м</span>
+                                    <span className="hz-stat-val">{speedPredict.stat.duration.toFixed(2)}с</span>
+                                  </span>
+                                </>
+                              )}
+                            </span>
+                          )}
+                        </div>
                       </div>
                     )}
 
