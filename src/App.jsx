@@ -4,7 +4,20 @@ import { parquetReadObjects } from 'hyparquet'
 import './App.css'
 
 // ── Constants ──────────────────────────────────────────────────────────────
-const API_BASE = import.meta.env.VITE_API_BASE ?? ''
+const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000'
+
+// Math.max/min(...array) blows the call stack on long sessions (V8 caps spread
+// argument count well below typical sample counts) — reduce instead.
+function arrayMax(arr) {
+  let m = -Infinity
+  for (let i = 0; i < arr.length; i++) if (arr[i] > m) m = arr[i]
+  return m
+}
+function arrayMin(arr) {
+  let m = Infinity
+  for (let i = 0; i < arr.length; i++) if (arr[i] < m) m = arr[i]
+  return m
+}
 
 function parseApiError(errData, status) {
   const detail = errData?.detail
@@ -726,7 +739,7 @@ export default function App() {
       setOffsetST(hasST ? computeAutoOffsetST(colMap, tCol, insole) : 0)
 
       const tVals   = (colMap[tCol] || []).map(safeNum).filter(v => v !== null)
-      const tMax    = tVals.length ? Math.max(...tVals) : 0
+      const tMax    = tVals.length ? arrayMax(tVals) : 0
       const autoUnit = tMax > 3600 ? 'ms' : 's'
       setTimeUnit(autoUnit)
       timeUnitRef.current = autoUnit
@@ -1306,7 +1319,7 @@ export default function App() {
       setOffsetST(hasST ? computeAutoOffsetST(colMap, tCol, insole) : 0)
 
       const tVals   = (colMap[tCol] || []).map(safeNum).filter(v => v !== null)
-      const tMax    = tVals.length ? Math.max(...tVals) : 0
+      const tMax    = tVals.length ? arrayMax(tVals) : 0
       const autoUnit = tMax > 3600 ? 'ms' : 's'
       setTimeUnit(autoUnit)
       timeUnitRef.current = autoUnit
@@ -1457,8 +1470,8 @@ export default function App() {
       setStatus({ text: `Колонка "${timeCol}" пустая`, type: 'error' })
       return
     }
-    const xMin = Math.min(...allTVals)
-    const xMax = Math.max(...allTVals)
+    const xMin = arrayMin(allTVals)
+    const xMax = arrayMax(allTVals)
 
     const n    = selectedCols.length
     const gap  = 0.03
@@ -1475,7 +1488,7 @@ export default function App() {
         vals = [...vals, ...(dataST[stCol] || []).map(safeNum).filter(v => v !== null)]
       }
       if (!vals.length) { yRanges[col] = [-1, 1]; return }
-      const mn = Math.min(...vals), mx = Math.max(...vals)
+      const mn = arrayMin(vals), mx = arrayMax(vals)
       const p  = Math.max((mx - mn) * 0.08, 0.1)
       yRanges[col] = [mn - p, mx + p]
     })
