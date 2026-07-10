@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "calculator-api": "cd ../MiraiTech-backend && DEBUG=false poetry run uvicorn calculator_api:app --app-dir ../miraitech_markup_service --host 127.0.0.1 --port 5174",
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview"
