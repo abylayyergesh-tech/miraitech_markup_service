@@ -4,7 +4,20 @@ import { parquetReadObjects } from 'hyparquet'
 import './App.css'
 
 // ── Constants ──────────────────────────────────────────────────────────────
-const API_BASE = import.meta.env.VITE_API_BASE ?? ''
+const API_BASE = import.meta.env.VITE_API_BASE ?? 'https://dev-api.miraitech.health'
+
+// Math.max/min(...array) blows the call stack on long sessions (V8 caps spread
+// argument count well below typical sample counts) — reduce instead.
+function arrayMax(arr) {
+  let m = -Infinity
+  for (let i = 0; i < arr.length; i++) if (arr[i] > m) m = arr[i]
+  return m
+}
+function arrayMin(arr) {
+  let m = Infinity
+  for (let i = 0; i < arr.length; i++) if (arr[i] < m) m = arr[i]
+  return m
+}
 
 function parseApiError(errData, status) {
   const detail = errData?.detail
@@ -63,6 +76,12 @@ const EXTRA_CALCULATORS = [
   },
 ]
 const EXTRA_CALCULATOR_BY_ID = Object.fromEntries(EXTRA_CALCULATORS.map(calc => [calc.id, calc]))
+
+// Insole pressure channels and the device-name → foot mapping used for
+// per-foot calibration/normalization (mirrors the backend: ESP32_Sensor_1 is
+// the left insole, ESP32_Sensor_2 the right).
+const SENSOR_COLS = ['Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4']
+const SENSOR_NAME_TO_FOOT = { ESP32_Sensor_1: 'left', ESP32_Sensor_2: 'right' }
 
 function parseSessionRows(raw) {
   if (Array.isArray(raw)) return raw
@@ -207,6 +226,94 @@ function addAccTkeoColumn(colMap, tCol) {
   })
 
   colMap['acc_tkeo'] = out
+}
+
+// A stored additional_info blob can arrive JSON-encoded one or more levels deep
+// (the backend double/triple-encodes it). Peel string layers until we reach a
+// real value or give up.
+function deepUnwrapJson(value, maxDepth = 4) {
+  let v = value
+  for (let i = 0; i < maxDepth && typeof v === 'string'; i++) {
+    try { v = JSON.parse(v) } catch { break }
+  }
+  return v
+}
+
+// A calibration bound must be exactly four finite numbers (booleans excluded —
+// typeof true !== 'number').
+function isCalibQuad(a) {
+  return Array.isArray(a) && a.length === 4
+    && a.every(x => typeof x === 'number' && isFinite(x))
+}
+
+// Pull { left, right } insole calibration out of a session's additional_info,
+// mirroring the backend shape
+// additional_info.intake_data.insole_calibration.{left,right}.{min,max}.
+// Returns null when it's absent or invalid, so callers fall back to the raw
+// Sensor_* values untouched.
+function extractInsoleCalibration(additionalInfo) {
+  const info = deepUnwrapJson(additionalInfo)
+  if (!info || typeof info !== 'object') return null
+  const intake = deepUnwrapJson(info.intake_data)
+  if (!intake || typeof intake !== 'object') return null
+  const calib = deepUnwrapJson(intake.insole_calibration)
+  if (!calib || typeof calib !== 'object') return null
+
+  const parseFoot = (footRaw) => {
+    const foot = deepUnwrapJson(footRaw)
+    if (!foot || typeof foot !== 'object') return null
+    const min = deepUnwrapJson(foot.min)
+    const max = deepUnwrapJson(foot.max)
+    return isCalibQuad(min) && isCalibQuad(max) ? { min, max } : null
+  }
+
+  const left = parseFoot(calib.left)
+  const right = parseFoot(calib.right)
+  if (!left && !right) return null
+  return { left, right }
+}
+
+// Per-timestep min-max normalization of one sensor reading into [0, 1].
+// Degenerate calibration (max <= min) contributes nothing (0).
+function normalizeSensorValue(value, mn, mx) {
+  const range = mx - mn
+  if (range <= 0) return 0.0
+  return Math.min(1.0, Math.max(0.0, (value - mn) / range))
+}
+
+// Derived channels: Sensor_1..4_Normalized in [0, 1]. Each row is normalized
+// with its own foot's calibration (ESP32_Sensor_1 → left, ESP32_Sensor_2 →
+// right), mirroring the backend insole_normalization but WITHOUT the
+// session-level aggregation to percentages — these stay raw per-timestep
+// normalized values so they can be plotted over time. Returns the list of
+// columns added (empty when the session carries no valid calibration, in which
+// case consumers keep using the raw Sensor_* columns).
+function addNormalizedSensorColumns(colMap, additionalInfo) {
+  const calib = extractInsoleCalibration(additionalInfo)
+  if (!calib) return []
+  const names = colMap['Name']
+  const added = []
+
+  SENSOR_COLS.forEach((col, si) => {
+    const raw = colMap[col]
+    if (!raw) return
+    const normCol = `${col}_Normalized`
+    if (colMap[normCol]) { added.push(normCol); return }
+
+    const out = new Array(raw.length).fill(null)
+    for (let i = 0; i < raw.length; i++) {
+      const v = safeNum(raw[i])
+      if (v === null) continue
+      const foot = names ? SENSOR_NAME_TO_FOOT[names[i]] : null
+      const footCalib = foot ? calib[foot] : null
+      if (!footCalib) continue // this foot lacks calibration → leave as no-data
+      out[i] = normalizeSensorValue(v, footCalib.min[si], footCalib.max[si])
+    }
+    colMap[normCol] = out
+    added.push(normCol)
+  })
+
+  return added
 }
 
 const L_FILL = 'rgba(31,119,180,0.35)'
@@ -761,6 +868,7 @@ export default function App() {
       const colMap = rowsToColMap(rows)
       const tCol = detectTimeCol(Object.keys(colMap))
       addAccTkeoColumn(colMap, tCol)
+      addNormalizedSensorColumns(colMap, result.additional_info)
       setParquetData(colMap)
       setTimeCol(tCol)
 
@@ -776,7 +884,7 @@ export default function App() {
       setOffsetST(hasST ? computeAutoOffsetST(colMap, tCol, insole) : 0)
 
       const tVals   = (colMap[tCol] || []).map(safeNum).filter(v => v !== null)
-      const tMax    = tVals.length ? Math.max(...tVals) : 0
+      const tMax    = tVals.length ? arrayMax(tVals) : 0
       const autoUnit = tMax > 3600 ? 'ms' : 's'
       setTimeUnit(autoUnit)
       timeUnitRef.current = autoUnit
@@ -1395,7 +1503,7 @@ export default function App() {
       setOffsetST(hasST ? computeAutoOffsetST(colMap, tCol, insole) : 0)
 
       const tVals   = (colMap[tCol] || []).map(safeNum).filter(v => v !== null)
-      const tMax    = tVals.length ? Math.max(...tVals) : 0
+      const tMax    = tVals.length ? arrayMax(tVals) : 0
       const autoUnit = tMax > 3600 ? 'ms' : 's'
       setTimeUnit(autoUnit)
       timeUnitRef.current = autoUnit
@@ -1406,7 +1514,13 @@ export default function App() {
       const sid = sessionId.trim()
       if (sid && token) {
         try {
-          await fetchSessionMarkupsFromDb(sid)
+          const sess = await fetchSessionMarkupsFromDb(sid)
+          // The parquet file carries no calibration; if the linked session does,
+          // derive the normalized channels now and refresh the column list.
+          if (addNormalizedSensorColumns(colMap, sess?.additional_info).length) {
+            setParquetData({ ...colMap })
+            setColumns(computeNumericColumns(colMap, tCol))
+          }
           setSessionLabel(`Сессия #${sid} · ${file.name}`)
         } catch {
           // parquet loaded; markups will load on save
@@ -1596,8 +1710,8 @@ export default function App() {
       setStatus({ text: `Колонка "${timeCol}" пустая`, type: 'error' })
       return
     }
-    const xMin = Math.min(...allTVals)
-    const xMax = Math.max(...allTVals)
+    const xMin = arrayMin(allTVals)
+    const xMax = arrayMax(allTVals)
 
     const n    = selectedCols.length
     const gap  = 0.03
@@ -1614,7 +1728,7 @@ export default function App() {
         vals = [...vals, ...(dataST[stCol] || []).map(safeNum).filter(v => v !== null)]
       }
       if (!vals.length) { yRanges[col] = [-1, 1]; return }
-      const mn = Math.min(...vals), mx = Math.max(...vals)
+      const mn = arrayMin(vals), mx = arrayMax(vals)
       const p  = Math.max((mx - mn) * 0.08, 0.1)
       yRanges[col] = [mn - p, mx + p]
     })
