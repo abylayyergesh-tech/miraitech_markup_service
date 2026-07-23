@@ -273,12 +273,13 @@ function extractInsoleCalibration(additionalInfo) {
   return { left, right }
 }
 
-// Per-timestep min-max normalization of one sensor reading into [0, 1].
+// Per-timestep min-max normalization of one sensor reading. Values outside the
+// calibration's [min, max] are left unclamped (can go <0 or >1).
 // Degenerate calibration (max <= min) contributes nothing (0).
 function normalizeSensorValue(value, mn, mx) {
   const range = mx - mn
   if (range <= 0) return 0.0
-  return Math.min(1.0, Math.max(0.0, (value - mn) / range))
+  return (value - mn) / range
 }
 
 // Derived channels: Sensor_1..4_Normalized in [0, 1]. Each row is normalized
