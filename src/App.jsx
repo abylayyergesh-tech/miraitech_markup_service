@@ -52,6 +52,30 @@ const ST_COL_COLORS = {
 const SPEED_PRED_COLS = new Set(['Speed', 'VelocityMs'])
 const DISTANCE_PRED_COLS = new Set(['Distance', 'DistanceM'])
 const PRED_COLOR = '#d62728'
+const EXTRA_CALCULATORS = [
+  {
+    id: 'step-detector-ttest',
+    label: 'Step Detector T-Test',
+    description: 'Контакты по давлению Sensor 1 + Sensor 2',
+    color: '#7c3aed',
+    fill: 'rgba(124,58,237,0.10)',
+  },
+  {
+    id: 'tkeo-cadence',
+    label: 'TKEO Cadence',
+    description: 'Каденс и контакты по TKEO акселерометра',
+    color: '#0891b2',
+    fill: 'rgba(8,145,178,0.10)',
+  },
+  {
+    id: 'step-cadence',
+    label: 'Step Cadence',
+    description: 'ML-контакты и фактическое время опоры',
+    color: '#d97706',
+    fill: 'rgba(217,119,6,0.10)',
+  },
+]
+const EXTRA_CALCULATOR_BY_ID = Object.fromEntries(EXTRA_CALCULATORS.map(calc => [calc.id, calc]))
 
 function parseSessionRows(raw) {
   if (Array.isArray(raw)) return raw
@@ -72,6 +96,17 @@ function rowsToColMap(rows) {
   Object.keys(rows[0]).forEach(k => { colMap[k] = [] })
   rows.forEach(row => Object.entries(row).forEach(([k, v]) => colMap[k].push(v)))
   return colMap
+}
+
+function colMapToRows(colMap) {
+  const columns = Object.keys(colMap || {})
+  if (!columns.length) return []
+  const length = Math.max(...columns.map(column => colMap[column]?.length || 0))
+  return Array.from({ length }, (_, index) => {
+    const row = {}
+    columns.forEach(column => { row[column] = colMap[column]?.[index] ?? null })
+    return row
+  })
 }
 
 function detectTimeCol(allCols) {
@@ -417,6 +452,10 @@ export default function App() {
   const [predictLoading, setPredictLoading] = useState(false)
   const [showSpeedPredict, setShowSpeedPredict] = useState(false)
   const [showDistancePredict, setShowDistancePredict] = useState(false)
+  const [extraCalculatorsOpen, setExtraCalculatorsOpen] = useState(false)
+  const [calculatorResults, setCalculatorResults] = useState({})
+  const [activeCalculators, setActiveCalculators] = useState([])
+  const [calculatorLoading, setCalculatorLoading] = useState('')
   const [checkHzData, setCheckHzData]   = useState(null)
   const [selectedCols, setSelectedCols] = useState([])
   const [timeCol, setTimeCol]           = useState('Time')
@@ -471,6 +510,10 @@ export default function App() {
   const plotInitRef      = useRef(false)
   const contactShapesRef = useRef([])
   const gapShapesRef     = useRef([])
+  const calculatorShapesRef = useRef([])
+  const calculatorResultsRef = useRef({})
+  const activeCalculatorsRef = useRef([])
+  const calculatorDataVersionRef = useRef(0)
   const cursorShapesRef  = useRef([])
   const selectedColsRef  = useRef([])
   const anglesUnwrappedRef = useRef(false)
@@ -515,6 +558,8 @@ export default function App() {
   useEffect(() => { anglesUnwrappedRef.current = anglesUnwrapped }, [anglesUnwrapped])
   useEffect(() => { selectedMarkupRef.current = selectedMarkup }, [selectedMarkup])
   useEffect(() => { relabelStepRef.current = relabelStep }, [relabelStep])
+  useEffect(() => { calculatorResultsRef.current = calculatorResults }, [calculatorResults])
+  useEffect(() => { activeCalculatorsRef.current = activeCalculators }, [activeCalculators])
 
   useEffect(() => {
     if (!selectedMarkup) return
@@ -677,6 +722,11 @@ export default function App() {
     setSpeedPredict(null)
     setShowSpeedPredict(false)
     setShowDistancePredict(false)
+    calculatorDataVersionRef.current += 1
+    setCalculatorResults({})
+    setActiveCalculators([])
+    setCalculatorLoading('')
+    setExtraCalculatorsOpen(false)
     setOffsetST(0)
     setShowGaps(false)
     setCheckHzData(null)
@@ -811,6 +861,35 @@ export default function App() {
     }
     contactShapesRef.current = contactShapes
 
+    const calculatorShapes = []
+    const timeScale = timeUnitRef.current === 'ms' ? 1000 : 1
+    activeCalculatorsRef.current.forEach(calculatorId => {
+      const style = EXTRA_CALCULATOR_BY_ID[calculatorId]
+      const result = calculatorResultsRef.current[calculatorId]
+      if (!style || !result?.contacts?.length) return
+
+      result.contacts.forEach(contact => {
+        if (contact.foot === 'left' && !showSensor1) return
+        if (contact.foot === 'right' && !showSensor2) return
+        const shift = contact.foot === 'right' ? offsetS2Ref.current : offsetS1Ref.current
+        const x0 = contact.start_time_s * timeScale + shift
+        const x1 = contact.end_time_s * timeScale + shift
+        if (!isFinite(x0) || !isFinite(x1) || x1 <= x0) return
+        calculatorShapes.push({
+          type: 'rect', x0, x1,
+          y0: 0, y1: 1, yref: 'paper',
+          fillcolor: style.fill,
+          line: {
+            color: style.color,
+            width: contact.kind === 'plateau' ? 2 : 1.25,
+            dash: contact.foot === 'right' ? 'dot' : 'dash',
+          },
+          layer: 'below',
+        })
+      })
+    })
+    calculatorShapesRef.current = calculatorShapes
+
     const gapShapes = []
     if (showGapsRef.current && checkHzData) {
       const seen = new Set()
@@ -836,7 +915,12 @@ export default function App() {
     gapShapesRef.current = gapShapes
 
     Plotly.relayout(chartDivRef.current, {
-      shapes: [...gapShapesRef.current, ...contactShapesRef.current, ...cursorShapesRef.current],
+      shapes: [
+        ...gapShapesRef.current,
+        ...calculatorShapesRef.current,
+        ...contactShapesRef.current,
+        ...cursorShapesRef.current,
+      ],
     })
   }, [showGaps, checkHzData, insoleSensorNames, showSensor1, showSensor2])
 
@@ -854,7 +938,7 @@ export default function App() {
 
   useEffect(() => {
     if (plotInitRef.current && chartDivRef.current) updateOverlayShapes()
-  }, [showGaps, checkHzData, showSensor1, showSensor2, showSpeedTracker, offsetS1, offsetS2, offsetST, selectedCols, selectedMarkup, updateOverlayShapes])
+  }, [showGaps, checkHzData, showSensor1, showSensor2, showSpeedTracker, offsetS1, offsetS2, offsetST, timeUnit, selectedCols, selectedMarkup, calculatorResults, activeCalculators, updateOverlayShapes])
 
   useEffect(() => {
     if (!chartReady || !chartDivRef.current) return
@@ -1281,6 +1365,11 @@ export default function App() {
     setSpeedPredict(null)
     setShowSpeedPredict(false)
     setShowDistancePredict(false)
+    calculatorDataVersionRef.current += 1
+    setCalculatorResults({})
+    setActiveCalculators([])
+    setCalculatorLoading('')
+    setExtraCalculatorsOpen(false)
     setOffsetST(0)
     setShowGaps(false)
     setCheckHzData(null)
@@ -1423,6 +1512,56 @@ export default function App() {
       setStatus({ text: `Ошибка distance predict: ${err.message}`, type: 'error' })
     }
   }, [showDistancePredict, ensurePredictSeries, columns, selectedCols])
+
+  const toggleAdditionalCalculator = useCallback(async (calculatorId) => {
+    if (activeCalculators.includes(calculatorId)) {
+      setActiveCalculators(prev => prev.filter(id => id !== calculatorId))
+      return
+    }
+
+    if (calculatorResults[calculatorId]) {
+      setActiveCalculators(prev => prev.includes(calculatorId) ? prev : [...prev, calculatorId])
+      return
+    }
+
+    if (!parquetData || calculatorLoading) return
+
+    const dataVersion = calculatorDataVersionRef.current
+    setCalculatorLoading(calculatorId)
+    try {
+      const resp = await fetch(`/calculator-api/calculate/${calculatorId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'accept': 'application/json' },
+        body: JSON.stringify({ rows: colMapToRows(parquetData) }),
+      })
+      if (!resp.ok) {
+        const errData = await resp.json().catch(() => ({}))
+        throw new Error(parseApiError(errData, resp.status))
+      }
+
+      const data = await resp.json()
+      if (dataVersion !== calculatorDataVersionRef.current) return
+
+      setCalculatorResults(prev => ({ ...prev, [calculatorId]: data }))
+      setActiveCalculators(prev => prev.includes(calculatorId) ? prev : [...prev, calculatorId])
+
+      const left = data.summary?.left?.contact_count || 0
+      const right = data.summary?.right?.contact_count || 0
+      const cadence = data.summary?.cadence_spm
+      setStatus({
+        text: `✓ ${data.label}: L ${left} · R ${right}${cadence != null ? ` · ${cadence.toFixed(0)} spm` : ''}`,
+        type: 'ok',
+      })
+    } catch (err) {
+      if (dataVersion !== calculatorDataVersionRef.current) return
+      const localHint = err instanceof TypeError
+        ? 'Локальный API калькуляторов недоступен — запустите npm run calculator-api'
+        : err.message
+      setStatus({ text: `Ошибка калькулятора: ${localHint}`, type: 'error' })
+    } finally {
+      if (dataVersion === calculatorDataVersionRef.current) setCalculatorLoading('')
+    }
+  }, [activeCalculators, calculatorResults, parquetData, calculatorLoading])
 
   // ── Build Plotly chart ────────────────────────────────────────────────────
   const renderChart = useCallback(() => {
@@ -2005,8 +2144,11 @@ export default function App() {
                       </div>
                     )}
 
-                    {hasSpeedTracker && (
-                      <div className="sidebar-block-row">
+                    {(hasSpeedTracker || insoleSensorNames.length > 0) && (
+                      <div className="calculator-panel">
+                        <span className="sidebar-block-lbl">Калькуляторы</span>
+                        {hasSpeedTracker && (
+                          <div className="sidebar-block-row calculator-primary-row">
                         <div className="sidebar-block">
                           <span className="sidebar-block-lbl">Прогноз скорости</span>
                           <button
@@ -2095,6 +2237,63 @@ export default function App() {
                             </span>
                           )}
                         </div>
+                          </div>
+                        )}
+
+                        <button
+                          type="button"
+                          className={`calculator-expand${extraCalculatorsOpen ? ' open' : ''}`}
+                          onClick={() => setExtraCalculatorsOpen(open => !open)}
+                          aria-expanded={extraCalculatorsOpen}
+                          aria-controls="extra-calculators"
+                        >
+                          <span>
+                            Другие калькуляторы
+                            {activeCalculators.length > 0 && (
+                              <span className="calculator-active-count">{activeCalculators.length}</span>
+                            )}
+                          </span>
+                          <span className="calculator-expand-chevron">⌄</span>
+                        </button>
+
+                        {extraCalculatorsOpen && (
+                          <div id="extra-calculators" className="calculator-options">
+                            {EXTRA_CALCULATORS.map(calculator => {
+                              const active = activeCalculators.includes(calculator.id)
+                              const loading = calculatorLoading === calculator.id
+                              const result = calculatorResults[calculator.id]
+                              const summary = result?.summary
+                              const leftCount = summary?.left?.contact_count || 0
+                              const rightCount = summary?.right?.contact_count || 0
+                              return (
+                                <div key={calculator.id} className="calculator-option">
+                                  <button
+                                    type="button"
+                                    className={`btn-secondary btn-calculator${active ? ' active' : ''}`}
+                                    style={{ '--calculator-color': calculator.color }}
+                                    disabled={!parquetData || !!calculatorLoading}
+                                    onClick={() => toggleAdditionalCalculator(calculator.id)}
+                                    title={active
+                                      ? `Убрать ${calculator.label} с графика`
+                                      : `Запустить ${calculator.label} для загруженных данных`}
+                                  >
+                                    <span className="calculator-dot" />
+                                    {loading ? 'Считаю…' : active ? `Убрать ${calculator.label}` : calculator.label}
+                                  </button>
+                                  <span className="calculator-description">{calculator.description}</span>
+                                  {result && (
+                                    <span className="calculator-summary" style={{ '--calculator-color': calculator.color }}>
+                                      L {leftCount} · R {rightCount}
+                                      {summary?.cadence_spm != null && ` · ${summary.cadence_spm.toFixed(0)} spm`}
+                                      {summary?.left?.mean_contact_duration_s != null
+                                        && ` · GCT L ${(summary.left.mean_contact_duration_s * 1000).toFixed(0)} ms`}
+                                    </span>
+                                  )}
+                                </div>
+                              )
+                            })}
+                          </div>
+                        )}
                       </div>
                     )}
 
