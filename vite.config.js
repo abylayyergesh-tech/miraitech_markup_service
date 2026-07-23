@@ -82,7 +82,7 @@ export default defineConfig({
         rewrite: path => path.replace(/^\/calculator-api/, ''),
       },
       '/api': {
-        target: process.env.VITE_API_PROXY || 'http://localhost:8000',
+        target: process.env.VITE_API_PROXY || 'https://dev-api.miraitech.health',
         changeOrigin: true,
       },
     },
