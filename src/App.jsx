@@ -4,7 +4,7 @@ import { parquetReadObjects } from 'hyparquet'
 import './App.css'
 
 // ── Constants ──────────────────────────────────────────────────────────────
-const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000'
+const API_BASE = import.meta.env.VITE_API_BASE ?? 'https://dev-api.miraitech.health'
 
 // Math.max/min(...array) blows the call stack on long sessions (V8 caps spread
 // argument count well below typical sample counts) — reduce instead.
